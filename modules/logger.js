@@ -11,7 +11,11 @@ class Logger {
         this.timezone = options.timezone || 'Asia/Taipei';
         this.logLevel = options.logLevel || 'info';
         this.enableFileLogging = options.enableFileLogging ?? true;
-        this.enableConsoleColors = options.enableConsoleColors ?? true;
+        
+        // 檢測終端顏色支持
+        this.enableConsoleColors = this.detectColorSupport();
+        this.terminalType = this.detectTerminal();
+        
         this.maxLogSize = options.maxLogSize || 10 * 1024 * 1024;
         this.maxFiles = options.maxFiles || 5;
         
@@ -42,6 +46,13 @@ class Logger {
         };
         
         this.initializeLogFile();
+        
+        // 終端支持提示
+        if (!this.enableConsoleColors) {
+            console.log('⚠️  終端不支持 ANSI 顏色，日誌將以純文字格式顯示');
+            console.log('💡 建議：使用 iTerm2 或配置 VS Code 終端以獲得最佳體驗');
+        }
+        
         this.stats = {
             totalLogs: 0,
             errorLogs: 0,
@@ -49,6 +60,48 @@ class Logger {
             infoLogs: 0,
             debugLogs: 0
         };
+    }
+
+    /**
+     * 檢測終端顏色支持
+     */
+    detectColorSupport() {
+        // 強制顏色環境變數
+        if (process.env.FORCE_COLOR === '1' || process.env.FORCE_COLOR === '2' || process.env.FORCE_COLOR === '3') {
+            return true;
+        }
+        
+        // 禁用顏色環境變數
+        if (process.env.NO_COLOR) {
+            return false;
+        }
+        
+        // 檢查是否為 TTY 終端
+        if (process.stdout.isTTY === true) {
+            return true;
+        }
+        
+        // VS Code 終端等不支持 ANSI 顏色的環境
+        return false;
+    }
+
+    /**
+     * 檢測終端類型
+     */
+    detectTerminal() {
+        if (process.stdout.isTTY === true) {
+            return 'TTY';
+        }
+        
+        if (process.env.TERM_PROGRAM === 'vscode') {
+            return 'VS Code';
+        }
+        
+        if (process.env.TERM) {
+            return process.env.TERM;
+        }
+        
+        return 'Unknown';
     }
 
     /**
@@ -68,15 +121,39 @@ class Logger {
         const processId = process.pid;
         const memUsage = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
         
-        // 🎯 控制台版本 (帶顏色)
-        const consoleMessage = this.enableConsoleColors ? 
-            `${this.colorize(levelConfig.icon, levelConfig.color)} ${this.colorize(`[${timestamp}]`, 'gray')} ${this.colorize(`[${memUsage}MB]`, 'gray')} ${message}` :
-            `${levelConfig.icon} [${timestamp}] [${memUsage}MB] ${message}`;
+        // 🎯 控制台版本 (根據終端支持調整)
+        let consoleMessage;
+        
+        if (this.enableConsoleColors) {
+            // 彩色輸出
+            consoleMessage = `${this.colorize(levelConfig.icon, levelConfig.color)} ${this.colorize(`[${timestamp}]`, 'gray')} ${this.colorize(`[${memUsage}MB]`, 'gray')} ${message}`;
+        } else {
+            // 純文字輸出，增強視覺效果
+            const prefix = this.getLevelPrefix(level);
+            consoleMessage = `${prefix} [${timestamp}] [${memUsage}MB] ${message}`;
+        }
             
         // 🗃️ 文件版本 (無顏色)
         const fileMessage = `[${moment().tz(this.timezone).format('YYYY-MM-DD HH:mm:ss')}] [${levelConfig.prefix}] [PID:${processId}] [MEM:${memUsage}MB] ${message}`;
         
         return { consoleMessage, fileMessage };
+    }
+
+    /**
+     * 為非彩色終端獲取等級前綴
+     */
+    getLevelPrefix(level) {
+        const prefixes = {
+            error: '[ERROR] ',
+            warn: '[WARN]  ',
+            info: '[INFO]  ',
+            success: '[OK]    ',
+            debug: '[DEBUG] ',
+            performance: '[PERF]  ',
+            database: '[DB]    ',
+            blockchain: '[CHAIN]'
+        };
+        return prefixes[level] || '[INFO]  ';
     }
 
     /**
