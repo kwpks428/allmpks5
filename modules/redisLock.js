@@ -76,15 +76,15 @@ class RedisLock {
      */
     async releaseLock(key) {
         try {
-            const lockKey = this.lockPrefix + key;
+            const lockKey = key.startsWith(this.lockPrefix) ? key : this.lockPrefix + key;
             const result = await this.client.del(lockKey);
-            
+
             if (result > 0) {
                 console.log(`🔓 成功釋放鎖: ${lockKey}`);
             } else {
                 console.log(`⚠️  鎖不存在或已過期: ${lockKey}`);
             }
-            
+
             return result > 0;
         } catch (error) {
             console.error('❌ 釋放鎖失敗:', error);
@@ -99,7 +99,7 @@ class RedisLock {
      */
     async isLocked(key) {
         try {
-            const lockKey = this.lockPrefix + key;
+            const lockKey = key.startsWith(this.lockPrefix) ? key : this.lockPrefix + key;
             const result = await this.client.exists(lockKey);
             return result === 1;
         } catch (error) {
@@ -116,15 +116,15 @@ class RedisLock {
      */
     async extendLock(key, ttl = 120) {
         try {
-            const lockKey = this.lockPrefix + key;
+            const lockKey = key.startsWith(this.lockPrefix) ? key : this.lockPrefix + key;
             const result = await this.client.expire(lockKey, ttl);
-            
+
             if (result > 0) {
                 console.log(`🔄 成功延長鎖: ${lockKey} (新TTL: ${ttl}s)`);
             } else {
                 console.log(`⚠️  延長鎖失敗: ${lockKey} (可能已過期)`);
             }
-            
+
             return result > 0;
         } catch (error) {
             console.error('❌ 延長鎖失敗:', error);
@@ -140,7 +140,7 @@ class RedisLock {
         try {
             const pattern = this.lockPrefix + '*';
             const keys = await this.client.keys(pattern);
-            
+
             let cleanedCount = 0;
             for (const key of keys) {
                 const ttl = await this.client.ttl(key);
@@ -150,7 +150,7 @@ class RedisLock {
                     cleanedCount++;
                 }
             }
-            
+
             console.log(`🧹 清理了 ${cleanedCount} 個過期鎖`);
             return cleanedCount;
         } catch (error) {
@@ -167,12 +167,12 @@ class RedisLock {
         try {
             const pattern = this.lockPrefix + '*';
             const keys = await this.client.keys(pattern);
-            
+
             const lockStatus = [];
             for (const key of keys) {
                 const ttl = await this.client.ttl(key);
                 const value = await this.client.get(key);
-                
+
                 lockStatus.push({
                     key: key.replace(this.lockPrefix, ''),
                     value: value,
@@ -180,7 +180,7 @@ class RedisLock {
                     status: ttl > 0 ? 'active' : 'expired'
                 });
             }
-            
+
             return lockStatus;
         } catch (error) {
             console.error('❌ 獲取鎖狀態失敗:', error);
