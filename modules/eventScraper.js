@@ -38,6 +38,11 @@ class EventScraper {
 
         // 🚀 RPC 優化：批量請求配置
         this.batchSize = 50; // 批量獲取區塊時間戳的最大數量
+
+        // 🚀 RPC 優化：區塊範圍預熱機制
+        this.blockRangePrewarm = new Map();
+        this.prewarmBatchSize = 10; // 預熱批次大小
+        this.prewarmEnabled = true; // 預熱開關
     }
 
     /**
@@ -168,8 +173,16 @@ class EventScraper {
         try {
             this.trackRpcCall();
             const currentEpoch = await this.contract.currentEpoch();
-            console.log(`📊 當前最新局次: ${Number(currentEpoch)}`);
-            return Number(currentEpoch);
+            const epochNum = Number(currentEpoch);
+            console.log(`📊 當前最新局次: ${epochNum}`);
+
+            // 🚀 RPC 優化：獲取當前局次後自動開始預熱
+            if (this.prewarmEnabled && !this.blockRangePrewarm.has('started')) {
+                this.blockRangePrewarm.set('started', true);
+                this.prewarmBlockRanges();
+            }
+
+            return epochNum;
         } catch (error) {
             console.error('❌ 獲取當前局次失敗:', error);
             throw error;
@@ -305,14 +318,15 @@ class EventScraper {
     }
 
     /**
-     * 🚀 RPC 優化：優化的二分搜索算法
-     * 減少RPC調用次數，使用更智能的搜索策略
+     * 🚀 RPC 優化：超級優化的二分搜索算法
+     * 目標：將 RPC 調用次數減少到 50-100 次以內
+     * 策略：多階段搜索 + 更精確的估算 + 區塊範圍預熱
      */
     async findExactBlockByTimestampOptimized(targetTime, type = 'start') {
         const isStartSearch = type === 'start';
         const searchDesc = isStartSearch ? '第一個 >= 目標時間' : '最後一個 < 目標時間';
 
-        console.log(`🔍 二分搜索: 尋找${searchDesc}的區塊 (目標: ${new Date(targetTime * 1000).toISOString()})`);
+        console.log(`🔍 超級二分搜索: 尋找${searchDesc}的區塊 (目標: ${new Date(targetTime * 1000).toISOString()})`);
 
         this.trackRpcCall();
         const latestBlock = await this.provider.getBlockNumber();
@@ -321,13 +335,15 @@ class EventScraper {
         let right = latestBlock;
         let result = isStartSearch ? latestBlock : 0;
         let iterations = 0;
-        const maxIterations = Math.ceil(Math.log2(latestBlock)) + 5;
+        let rpcCalls = 0;
 
-        // 🚀 RPC 優化：預先獲取區塊時間戳範圍，減少搜索次數
+        // 🚀 階段1：粗略估算，使用更大的步長快速縮小範圍
+        console.log(`   📊 階段1: 粗略估算範圍...`);
+
+        // 獲取邊界時間戳
         let leftTime, rightTime;
-
         try {
-            this.trackRpcCall();
+            this.trackRpcCall(); rpcCalls++;
             const [leftBlock, rightBlock] = await Promise.all([
                 this.provider.getBlock(left),
                 this.provider.getBlock(right)
@@ -340,46 +356,129 @@ class EventScraper {
             rightTime = Math.floor(Date.now() / 1000);
         }
 
-        // 🚀 RPC 優化：估算初始位置，減少迭代次數
+        // 🚀 粗略估算：優先使用智能估算，然後使用樣本點進行更精確估算
         if (targetTime >= leftTime && targetTime <= rightTime) {
-            const estimatedPosition = Math.floor(left + (right - left) * (targetTime - leftTime) / (rightTime - leftTime));
-            const mid = Math.max(left, Math.min(right, estimatedPosition));
+            const timeRange = rightTime - leftTime;
+            const blockRange = right - left;
 
+            // 首先嘗試智能估算
+            const smartEstimate = this.getSmartBlockEstimate(targetTime);
+            let initialEstimate = null;
+
+            if (smartEstimate && smartEstimate.confidence > 0.3) {
+                initialEstimate = smartEstimate.estimatedBlock;
+                console.log(`   📊 智能估算: 區塊 ${initialEstimate}, 置信度 ${(smartEstimate.confidence * 100).toFixed(1)}%`);
+            }
+
+            // 使用多個樣本點進行線性回歸估算
+            const samplePoints = 5;
+            const sampleBlocks = [];
+            const sampleTimes = [];
+
+            // 如果有智能估算，優先在估算位置附近取樣
+            if (initialEstimate && initialEstimate > left && initialEstimate < right) {
+                const sampleRange = Math.floor(blockRange / samplePoints);
+                for (let i = 0; i < samplePoints; i++) {
+                    const offset = (i - 2) * sampleRange; // -2, -1, 0, 1, 2
+                    const sampleBlock = Math.max(left, Math.min(right, initialEstimate + offset));
+                    sampleBlocks.push(sampleBlock);
+                }
+            } else {
+                // 回退到均勻取樣
+                for (let i = 0; i < samplePoints; i++) {
+                    const sampleBlock = left + Math.floor((blockRange * (i + 1)) / (samplePoints + 1));
+                    sampleBlocks.push(sampleBlock);
+                }
+            }
+
+            // 批量獲取樣本區塊時間戳
             try {
-                this.trackRpcCall();
+                this.trackRpcCall(); rpcCalls++;
+                const sampleBlockData = await Promise.all(
+                    sampleBlocks.map(blockNum => this.provider.getBlock(blockNum))
+                );
+
+                sampleBlockData.forEach(blockData => {
+                    sampleTimes.push(blockData.timestamp);
+                });
+
+                // 使用線性回歸計算更精確的估算位置
+                let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+                for (let i = 0; i < samplePoints; i++) {
+                    const x = sampleBlocks[i];
+                    const y = sampleTimes[i];
+                    sumX += x;
+                    sumY += y;
+                    sumXY += x * y;
+                    sumXX += x * x;
+                }
+
+                const slope = (samplePoints * sumXY - sumX * sumY) / (samplePoints * sumXX - sumX * sumX);
+                const intercept = (sumY - slope * sumX) / samplePoints;
+
+                const estimatedPosition = Math.floor((targetTime - intercept) / slope);
+                const mid = Math.max(left, Math.min(right, estimatedPosition));
+
+                // 驗證估算位置
+                this.trackRpcCall(); rpcCalls++;
                 const midBlock = await this.provider.getBlock(mid);
                 const midTime = midBlock.timestamp;
 
-                if ((isStartSearch && midTime >= targetTime) || (!isStartSearch && midTime < targetTime)) {
-                    result = mid;
+                console.log(`   📊 樣本估算: 區塊 ${mid}, 時間 ${new Date(midTime * 1000).toISOString()}, 誤差 ${Math.abs(midTime - targetTime)}s`);
+
+                // 根據估算結果調整搜索範圍
+                if (midTime < targetTime) {
+                    left = mid;
+                    leftTime = midTime;
+                } else {
+                    right = mid;
+                    rightTime = midTime;
                 }
 
-                // 根據中間值調整搜索範圍
-                if (midTime < targetTime) {
-                    left = mid + 1;
-                } else {
-                    right = mid - 1;
-                }
             } catch (error) {
-                console.warn(`   ⚠️ 估算位置失敗: ${error.message}`);
+                console.warn(`   ⚠️ 樣本估算失敗: ${error.message}`);
+                // 回退到簡單估算
+                const estimatedPosition = Math.floor(left + (right - left) * (targetTime - leftTime) / (rightTime - leftTime));
+                const mid = Math.max(left, Math.min(right, estimatedPosition));
+
+                if (mid > left && mid < right) {
+                    try {
+                        this.trackRpcCall(); rpcCalls++;
+                        const midBlock = await this.provider.getBlock(mid);
+                        const midTime = midBlock.timestamp;
+
+                        if (midTime < targetTime) {
+                            left = mid;
+                        } else {
+                            right = mid;
+                        }
+                    } catch (error) {
+                        console.warn(`   ⚠️ 簡單估算失敗: ${error.message}`);
+                    }
+                }
             }
         }
 
-        // 🚀 RPC 優化：減少日誌輸出頻率
-        const logInterval = Math.max(5, Math.floor(maxIterations / 10));
+        console.log(`   📊 粗略範圍縮小到: ${left} - ${right} (${right - left + 1} 個區塊), RPC調用: ${rpcCalls}`);
+
+        // 🚀 階段2：精細二分搜索，使用更小的步長
+        console.log(`   📊 階段2: 精細二分搜索...`);
+
+        const maxIterations = Math.min(50, Math.ceil(Math.log2(right - left)) + 10); // 限制最大迭代次數
+        const logInterval = Math.max(5, Math.floor(maxIterations / 8));
 
         while (left <= right && iterations < maxIterations) {
             iterations++;
             const mid = Math.floor((left + right) / 2);
 
             try {
-                this.trackRpcCall();
+                this.trackRpcCall(); rpcCalls++;
                 const block = await this.provider.getBlock(mid);
                 const blockTime = block.timestamp;
 
-                // 🚀 RPC 優化：減少日誌輸出
-                if (iterations % logInterval === 0 || right - left < 100) {
-                    console.log(`   📊 迭代 ${iterations}: 區塊 ${mid}, 時間差 ${blockTime - targetTime}s`);
+                // 減少日誌輸出
+                if (iterations % logInterval === 0 || right - left < 50) {
+                    console.log(`   📊 迭代 ${iterations}: 區塊 ${mid}, 時間差 ${blockTime - targetTime}s, 範圍 ${right - left + 1}`);
                 }
 
                 if (isStartSearch) {
@@ -398,19 +497,59 @@ class EventScraper {
                     }
                 }
 
+                // 提前終止條件：範圍已經很小
+                if (right - left < 10) {
+                    console.log(`   📊 範圍已縮小到 ${right - left + 1} 個區塊，提前終止搜索`);
+                    break;
+                }
+
             } catch (error) {
                 console.warn(`   ⚠️ 獲取區塊 ${mid} 失敗: ${error.message}`);
-                right = mid - 1;
+                // 出錯時保守地縮小範圍
+                if (isStartSearch) {
+                    right = mid - 1;
+                } else {
+                    left = mid + 1;
+                }
             }
         }
 
-        // 驗證結果
+        // 🚀 階段3：最終驗證和微調
+        console.log(`   📊 階段3: 最終驗證...`);
+
         try {
-            this.trackRpcCall();
+            this.trackRpcCall(); rpcCalls++;
             const resultBlock = await this.provider.getBlock(result);
             const timeDiff = resultBlock.timestamp - targetTime;
 
-            console.log(`   ✅ 搜索完成: 區塊 ${result}, 時間差 ${timeDiff}s, 迭代 ${iterations} 次`);
+            console.log(`   ✅ 搜索完成: 區塊 ${result}, 時間差 ${timeDiff}s, 總迭代 ${iterations} 次, 總RPC調用 ${rpcCalls} 次`);
+
+            // 微調：如果時間差太大，嘗試找更好的區塊
+            if (isStartSearch && timeDiff < -60) { // 開始搜索允許稍微早一點
+                // 檢查下一個區塊是否更好
+                try {
+                    this.trackRpcCall(); rpcCalls++;
+                    const nextBlock = await this.provider.getBlock(result + 1);
+                    if (nextBlock.timestamp >= targetTime && Math.abs(nextBlock.timestamp - targetTime) < Math.abs(timeDiff)) {
+                        result = result + 1;
+                        console.log(`   🔄 微調: 使用區塊 ${result} (更好的時間匹配)`);
+                    }
+                } catch (error) {
+                    // 忽略微調失敗
+                }
+            } else if (!isStartSearch && timeDiff > 60) { // 結束搜索允許稍微晚一點
+                // 檢查前一個區塊是否更好
+                try {
+                    this.trackRpcCall(); rpcCalls++;
+                    const prevBlock = await this.provider.getBlock(result - 1);
+                    if (prevBlock.timestamp < targetTime && Math.abs(prevBlock.timestamp - targetTime) < Math.abs(timeDiff)) {
+                        result = result - 1;
+                        console.log(`   🔄 微調: 使用區塊 ${result} (更好的時間匹配)`);
+                    }
+                } catch (error) {
+                    // 忽略微調失敗
+                }
+            }
 
             if (isStartSearch && timeDiff < -300) {
                 console.warn(`   ⚠️ 警告: 開始區塊時間比目標時間早 ${-timeDiff} 秒`);
@@ -716,6 +855,125 @@ class EventScraper {
                 }
             }
         });
+    }
+
+    /**
+     * 🚀 RPC 優化：區塊範圍預熱機制
+     * 在系統啟動時預先計算常用區塊範圍，減少首次請求延遲
+     */
+    async prewarmBlockRanges() {
+        if (!this.prewarmEnabled) {
+            console.log('🚀 區塊範圍預熱已禁用');
+            return;
+        }
+
+        try {
+            console.log('🚀 開始區塊範圍預熱...');
+
+            this.trackRpcCall();
+            const currentEpoch = await this.contract.currentEpoch();
+            const currentEpochNum = Number(currentEpoch);
+
+            // 預熱最近的 N 個局次
+            const epochsToPrewarm = [];
+            for (let i = 0; i < this.prewarmBatchSize; i++) {
+                const epoch = currentEpochNum - i;
+                if (epoch > 0) {
+                    epochsToPrewarm.push(epoch);
+                }
+            }
+
+            console.log(`🚀 預熱 ${epochsToPrewarm.length} 個局次的區塊範圍...`);
+
+            // 批量預熱，但不要阻塞主線程
+            setImmediate(async () => {
+                let prewarmed = 0;
+                let skipped = 0;
+
+                for (const epoch of epochsToPrewarm) {
+                    try {
+                        if (!this.getCachedBlockRange(epoch)) {
+                            await this.getBlockRangeForEpoch(epoch);
+                            prewarmed++;
+                        } else {
+                            skipped++;
+                        }
+                    } catch (error) {
+                        console.debug(`預熱局次 ${epoch} 失敗: ${error.message}`);
+                    }
+                }
+
+                console.log(`✅ 區塊範圍預熱完成: 新預熱 ${prewarmed} 個, 跳過 ${skipped} 個已緩存`);
+            });
+
+        } catch (error) {
+            console.warn('⚠️ 區塊範圍預熱失敗:', error.message);
+        }
+    }
+
+    /**
+     * 🚀 RPC 優化：智能區塊估算算法
+     * 使用歷史數據和趨勢分析提供更精確的區塊估算
+     */
+    getSmartBlockEstimate(targetTime) {
+        // 獲取最近的區塊範圍緩存作為估算依據
+        const cachedRanges = Array.from(this.blockRangeCache.values())
+            .map(entry => entry.data)
+            .filter(range => range && range.timeRange)
+            .sort((a, b) => b.timeRange.startTime - a.timeRange.startTime) // 按時間降序
+            .slice(0, 5); // 只用最近5個
+
+        if (cachedRanges.length < 2) {
+            return null; // 沒有足夠數據進行智能估算
+        }
+
+        // 計算區塊時間間隔趨勢
+        const trends = [];
+        for (let i = 0; i < cachedRanges.length - 1; i++) {
+            const current = cachedRanges[i];
+            const previous = cachedRanges[i + 1];
+
+            if (current.timeRange && previous.timeRange) {
+                const timeDiff = current.timeRange.startTime - previous.timeRange.startTime;
+                const blockDiff = current.from - previous.from;
+
+                if (timeDiff > 0 && blockDiff > 0) {
+                    const blocksPerSecond = blockDiff / timeDiff;
+                    trends.push({
+                        blocksPerSecond,
+                        weight: 1 / (i + 1) // 越近的數據權重越大
+                    });
+                }
+            }
+        }
+
+        if (trends.length === 0) {
+            return null;
+        }
+
+        // 加權平均計算區塊生成速率
+        let totalWeight = 0;
+        let weightedSum = 0;
+
+        trends.forEach(trend => {
+            weightedSum += trend.blocksPerSecond * trend.weight;
+            totalWeight += trend.weight;
+        });
+
+        const avgBlocksPerSecond = weightedSum / totalWeight;
+
+        // 使用最近的區塊範圍作為基準點
+        const reference = cachedRanges[0];
+        const timeDiff = targetTime - reference.timeRange.startTime;
+        const estimatedBlocks = Math.floor(timeDiff * avgBlocksPerSecond);
+        const estimatedBlock = reference.from + estimatedBlocks;
+
+        return {
+            estimatedBlock,
+            confidence: Math.min(trends.length / 5, 1), // 基於樣本數的置信度
+            avgBlocksPerSecond,
+            referenceEpoch: reference.timeRange ? 'unknown' : 'latest'
+        };
     }
 
     /**
