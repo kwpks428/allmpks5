@@ -52,7 +52,8 @@ class Database {
         try {
             const result = await this.pool.query(text, params);
             const duration = Date.now() - start;
-            console.log(`📊 查詢執行時間: ${duration}ms, 查詢: ${text.substring(0, 50)}...`);
+            // 查詢時間移到 debug 級別，避免輸出過多
+            this.debug(`📊 查詢執行時間: ${duration}ms, 查詢: ${text.substring(0, 50)}...`);
             return result;
         } catch (error) {
             console.error('❌ 資料庫查詢錯誤:', error);

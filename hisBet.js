@@ -53,62 +53,54 @@ class HisBetScraper {
         try {
             // 初始化Logger
             this.logger = new Logger();
-            this.logger.info('🚀 初始化 HisBet 數據抓取系統...');
-            console.log('✅ Logger 初始化成功');
+            this.logger.startup('HisBet 數據抓取系統');
 
             // 檢查環境變數
-            console.log('🔍 檢查環境配置...');
-            console.log('RPC_URL:', this.config.rpcUrl ? '✅' : '❌');
-            console.log('REDIS_URL:', this.config.redisUrl ? '✅' : '❌');
-            console.log('POSTGRES_URL:', this.config.postgresUrl ? '✅' : '❌');
+            this.logger.debug('🔍 檢查環境配置...');
+            this.logger.debug('RPC_URL:', this.config.rpcUrl ? '✅' : '❌');
+            this.logger.debug('REDIS_URL:', this.config.redisUrl ? '✅' : '❌');
+            this.logger.debug('POSTGRES_URL:', this.config.postgresUrl ? '✅' : '❌');
 
             // 初始化資料庫
-            console.log('🔄 初始化資料庫...');
+            this.logger.info('🔄 初始化資料庫...');
             this.db = new Database(this.config.postgresUrl);
             await this.db.connect();
-            this.logger.info('✅ 資料庫連接成功');
-            console.log('✅ 資料庫連接成功');
+            this.logger.success('✅ 資料庫連接成功');
 
             // 初始化Redis
-            console.log('🔄 初始化Redis...');
+            this.logger.info('🔄 初始化Redis...');
             this.redis = new RedisLock(this.config.redisUrl);
             await this.redis.connect();
-            this.logger.info('✅ Redis 連接成功');
-            console.log('✅ Redis 連接成功');
+            this.logger.success('✅ Redis 連接成功');
 
             // 初始化事件抓取器
-            console.log('🔄 初始化事件抓取器...');
+            this.logger.info('🔄 初始化事件抓取器...');
             this.eventScraper = new EventScraper(
                 this.config.rpcUrl,
                 this.config.contractAddress,
                 require('./abi.json')
             );
-            this.logger.info('✅ 事件抓取器初始化成功');
-            console.log('✅ 事件抓取器初始化成功');
+            this.logger.success('✅ 事件抓取器初始化成功');
 
             // 初始化數據驗證器
-            console.log('🔄 初始化數據驗證器...');
+            this.logger.info('🔄 初始化數據驗證器...');
             this.dataValidator = new DataValidator(this.config.timezone);
-            this.logger.info('✅ 數據驗證器初始化成功');
-            console.log('✅ 數據驗證器初始化成功');
+            this.logger.success('✅ 數據驗證器初始化成功');
 
             // 初始化事務管理器
-            console.log('🔄 初始化事務管理器...');
+            this.logger.info('🔄 初始化事務管理器...');
             this.transactionManager = new TransactionManager(this.db);
-            this.logger.info('✅ 事務管理器初始化成功');
-            console.log('✅ 事務管理器初始化成功');
+            this.logger.success('✅ 事務管理器初始化成功');
 
             // 初始化調度器
-            console.log('🔄 初始化調度器...');
+            this.logger.info('🔄 初始化調度器...');
             this.scheduler = new Scheduler(this);
-            this.logger.info('✅ 任務調度器初始化成功');
-            console.log('✅ 調度器初始化成功');
+            this.logger.success('✅ 任務調度器初始化成功');
 
             // 獲取當前最新局次
-            console.log('🔄 獲取當前局次...');
+            this.logger.info('🔄 獲取當前局次...');
             this.currentEpoch = await this.eventScraper.getCurrentEpoch();
-            this.logger.info(`📊 當前最新局次：${this.currentEpoch}`);
-            console.log('✅ 所有模組初始化完成');
+            this.logger.startup(`當前最新局次：${this.currentEpoch}`);
 
         } catch (error) {
             console.error('❌ 初始化失敗:', error);
@@ -169,24 +161,24 @@ class HisBetScraper {
      * @param {number} epoch 局次編號
      */
     async processEpoch(epoch) {
-        this.logger.info(`🎯 開始處理局次: ${epoch}`);
+        this.logger.processing(epoch);
 
         try {
             // 1. 檢查 finEpoch 表
             const exists = await this.db.checkFinEpoch(epoch);
             if (exists) {
-                this.logger.info(`⏭️  局次 ${epoch} 已完成，跳過`);
+                this.logger.debug(`⏭️  局次 ${epoch} 已完成，跳過`);
                 return;
             }
 
             // 2. 嘗試獲取 Redis 鎖
             const lockAcquired = await this.redis.acquireLock(`lock:pancake:epoch:${epoch}`, this.config.lockTimeout);
             if (!lockAcquired) {
-                this.logger.info(`🔒 局次 ${epoch} 正在被其他線程處理，跳過`);
+                this.logger.debug(`🔒 局次 ${epoch} 正在被其他線程處理，跳過`);
                 return;
             }
 
-            this.logger.info(`🔓 成功獲取局次 ${epoch} 的鎖`);
+            this.logger.success(`🔓 成功獲取局次 ${epoch} 的鎖`);
 
             // 3. 執行完整的處理流程
             await this.handleEpochProcessing(epoch);
@@ -223,6 +215,7 @@ class HisBetScraper {
 
         // 4. 批量抓取事件
         const eventsData = await this.eventScraper.fetchEventsInRange(blockRange.from, blockRange.to);
+        this.logger.blockchain('抓取事件', blockRange.to, Date.now());
         this.logger.info(`📊 抓取到 ${eventsData.totalEvents} 個事件`);
 
         // 5. 數據驗證
@@ -230,7 +223,7 @@ class HisBetScraper {
         if (!validationResult.isValid) {
             throw new Error(`數據驗證失敗: ${validationResult.errors.join(', ')}`);
         }
-        this.logger.info('✅ 數據驗證通過');
+        this.logger.success('✅ 數據驗證通過');
 
         // 6. 產生 multiClaim 資料
         const multiClaimData = this.generateMultiClaimData(validationResult.claimData);
@@ -253,7 +246,7 @@ class HisBetScraper {
             await trx.insert({ epoch }, 'finEpoch');
         });
 
-        this.logger.info(`✅ 局次 ${epoch} 處理完成`);
+        this.logger.completed(epoch, Date.now());
     }
 
     /**
@@ -312,7 +305,7 @@ class HisBetScraper {
         if (this.isShuttingDown) return;
 
         this.isShuttingDown = true;
-        this.logger.info('🔄 開始優雅關閉...');
+        this.logger.shutdown('開始優雅關閉');
 
         try {
             // 停止所有定時任務
@@ -330,7 +323,7 @@ class HisBetScraper {
                 await this.redis.disconnect();
             }
 
-            this.logger.info('✅ 系統已安全關閉');
+            this.logger.shutdown('系統已安全關閉');
             process.exit(0);
 
         } catch (error) {

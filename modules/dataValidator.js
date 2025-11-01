@@ -12,6 +12,20 @@ class DataValidator {
         this.amountPrecision = 0.00000001; // 金額精度 (1e-8 BNB)
         this.maxBetAmount = 1000; // 最大單次下注金額 (BNB)
         this.maxTotalAmount = 10000; // 最大總下注金額 (BNB)
+        
+        // 初始化 logger（如果可用）
+        try {
+            const Logger = require('./logger.js');
+            this.logger = Logger.getLogger();
+        } catch (error) {
+            this.logger = {
+                debug: () => {},
+                info: () => {},
+                warn: () => {},
+                error: () => {},
+                success: () => {}
+            };
+        }
     }
 
     /**
@@ -22,7 +36,7 @@ class DataValidator {
      */
     async validateEpochData(eventsData, currentEpoch = null) {
         try {
-            console.log('🔍 開始嚴格數據驗證...');
+            this.logger.debug('🔍 開始嚴格數據驗證...');
 
             // 🎯 如果沒有傳入 currentEpoch，從 StartRound 事件中獲取
             if (currentEpoch === null && eventsData.startRoundEvents.length > 0) {
@@ -76,9 +90,9 @@ class DataValidator {
             validationResult.stats = this.generateStats(validationResult);
 
             if (validationResult.isValid) {
-                console.log('✅ 嚴格數據驗證完成');
+                this.logger.success('✅ 嚴格數據驗證完成');
             } else {
-                console.log('❌ 數據驗證失敗:', validationResult.errors);
+                this.logger.error('❌ 數據驗證失敗:', validationResult.errors);
             }
 
             return validationResult;
@@ -116,7 +130,7 @@ class DataValidator {
         }
 
         // 統計事件信息
-        console.log('🔍 事件統計:', {
+        this.logger.debug('🔍 事件統計:', {
             startRoundEvents: eventsData.startRoundEvents.length,
             lockRoundEvents: eventsData.lockRoundEvents.length,
             endRoundEvents: eventsData.endRoundEvents.length,
@@ -125,7 +139,7 @@ class DataValidator {
             claimEvents: eventsData.claimEvents.length
         });
 
-        console.log('📊 第一個 StartRound 事件:', {
+        this.logger.debug('📊 第一個 StartRound 事件:', {
             epoch: startRound.epoch,
             blockNumber: startRound.blockNumber
         });
@@ -160,7 +174,7 @@ class DataValidator {
         }
 
         const targetEpoch = startRound.epoch;
-        console.log(`📊 事件完整性验证: 目标局次 ${targetEpoch}, 下注 ${allBetEvents.length}, claim ${eventsData.claimEvents.length}`);
+        this.logger.debug(`📊 事件完整性验证: 目标局次 ${targetEpoch}, 下注 ${allBetEvents.length}, claim ${eventsData.claimEvents.length}`);
     }
 
     /**
