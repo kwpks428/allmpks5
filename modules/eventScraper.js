@@ -23,10 +23,21 @@ class EventScraper {
         };
 
         this.weiToBNB = ethers.parseEther('1');
-        
+
         // RPC調用統計
         this.rpcCallCount = 0;
         this.lastResetTime = Date.now();
+
+        // 🚀 RPC 優化：區塊範圍緩存
+        this.blockRangeCache = new Map();
+        this.cacheExpiry = 5 * 60 * 1000; // 5分鐘緩存
+
+        // 🚀 RPC 優化：區塊時間戳緩存
+        this.blockTimestampCache = new Map();
+        this.timestampCacheExpiry = 10 * 60 * 1000; // 10分鐘緩存
+
+        // 🚀 RPC 優化：批量請求配置
+        this.batchSize = 50; // 批量獲取區塊時間戳的最大數量
     }
 
     /**
@@ -35,6 +46,100 @@ class EventScraper {
     resetRpcStats() {
         this.rpcCallCount = 0;
         this.lastResetTime = Date.now();
+    }
+
+    /**
+     * 🚀 RPC 優化：清理過期的緩存
+     */
+    cleanExpiredCache() {
+        const now = Date.now();
+
+        // 清理區塊範圍緩存
+        for (const [key, value] of this.blockRangeCache.entries()) {
+            if (now - value.timestamp > this.cacheExpiry) {
+                this.blockRangeCache.delete(key);
+            }
+        }
+
+        // 清理區塊時間戳緩存
+        for (const [key, value] of this.blockTimestampCache.entries()) {
+            if (now - value.timestamp > this.timestampCacheExpiry) {
+                this.blockTimestampCache.delete(key);
+            }
+        }
+    }
+
+    /**
+     * 🚀 RPC 優化：獲取區塊範圍緩存
+     */
+    getCachedBlockRange(epoch) {
+        const cached = this.blockRangeCache.get(epoch);
+        if (cached && Date.now() - cached.timestamp < this.cacheExpiry) {
+            return cached.data;
+        }
+        return null;
+    }
+
+    /**
+     * 🚀 RPC 優化：設置區塊範圍緩存
+     */
+    setCachedBlockRange(epoch, data) {
+        this.blockRangeCache.set(epoch, {
+            data,
+            timestamp: Date.now()
+        });
+    }
+
+    /**
+     * 🚀 RPC 優化：批量獲取區塊時間戳
+     */
+    async getBlockTimestampsBatch(blockNumbers) {
+        const now = Date.now();
+        const uncachedBlocks = [];
+        const result = new Map();
+
+        // 檢查緩存
+        for (const blockNum of blockNumbers) {
+            const cached = this.blockTimestampCache.get(blockNum);
+            if (cached && now - cached.timestamp < this.timestampCacheExpiry) {
+                result.set(blockNum, cached.timestamp);
+            } else {
+                uncachedBlocks.push(blockNum);
+            }
+        }
+
+        // 批量獲取未緩存的區塊
+        if (uncachedBlocks.length > 0) {
+            console.log(`   📦 批量獲取 ${uncachedBlocks.length} 個區塊時間戳...`);
+
+            // 分批處理，避免單次請求過大
+            for (let i = 0; i < uncachedBlocks.length; i += this.batchSize) {
+                const batch = uncachedBlocks.slice(i, i + this.batchSize);
+                const batchPromises = batch.map(async (blockNum) => {
+                    try {
+                        this.trackRpcCall();
+                        const block = await this.provider.getBlock(blockNum);
+                        return { blockNum, timestamp: block.timestamp };
+                    } catch (error) {
+                        console.warn(`   ⚠️ 獲取區塊 ${blockNum} 時間戳失敗: ${error.message}`);
+                        return { blockNum, timestamp: Math.floor(Date.now() / 1000) };
+                    }
+                });
+
+                const batchResults = await Promise.all(batchPromises);
+
+                // 更新結果和緩存
+                for (const { blockNum, timestamp } of batchResults) {
+                    result.set(blockNum, timestamp);
+                    this.blockTimestampCache.set(blockNum, {
+                        timestamp,
+                        cachedAt: now
+                    });
+                }
+            }
+        }
+
+        return result;
     }
 
     /**
@@ -72,20 +177,36 @@ class EventScraper {
     }
 
     /**
-     * 🎯 核心方法：嚴格按照時間範圍獲取區塊範圍
+     * 🎯 核心方法：嚴格按照時間範圍獲取區塊範圍 (優化版)
      * 策略：當前局次開始時間 -> 下一局開始時間
+     * 🚀 RPC 優化：添加緩存機制，減少重複請求
      * @param {number} epoch 局次編號
      * @returns {Promise<Object>} 區塊範圍 {from, to, timeRange}
      */
     async getBlockRangeForEpoch(epoch) {
         try {
+            // 🚀 RPC 優化：檢查緩存
+            const cached = this.getCachedBlockRange(epoch);
+            if (cached) {
+                console.log(`🔍 為局次 ${epoch} 獲取區塊範圍 (從緩存)...`);
+                console.log(`✅ 局次 ${epoch} 區塊範圍確定 (緩存):`);
+                console.log(`   📍 起始區塊: ${cached.from}`);
+                console.log(`   📍 結束區塊: ${cached.to}`);
+                console.log(`   📊 區塊總數: ${(cached.to - cached.from + 1).toLocaleString()}`);
+                console.log(`   🚀 RPC調用: 0 次 (使用緩存)`);
+                return cached;
+            }
+
             console.log(`🔍 為局次 ${epoch} 獲取區塊範圍...`);
-            
+
+            // 清理過期緩存
+            this.cleanExpiredCache();
+
             // 1. 獲取當前局次的時間戳信息
             this.trackRpcCall();
             const currentRoundInfo = await this.contract.rounds(epoch);
             const startTime = Number(currentRoundInfo.startTimestamp);
-            
+
             if (startTime === 0) {
                 throw new Error(`局次 ${epoch} 尚未開始或無效`);
             }
@@ -95,12 +216,12 @@ class EventScraper {
             // 2. 獲取下一局的開始時間作為結束邊界
             let endTime;
             let nextEpochExists = false;
-            
+
             try {
                 this.trackRpcCall();
                 const nextRoundInfo = await this.contract.rounds(epoch + 1);
                 const nextStartTime = Number(nextRoundInfo.startTimestamp);
-                
+
                 if (nextStartTime > 0) {
                     endTime = nextStartTime;
                     nextEpochExists = true;
@@ -124,11 +245,13 @@ class EventScraper {
             const duration = endTime - startTime;
             console.log(`⏱️ 時間範圍: ${duration} 秒 (${Math.floor(duration / 60)} 分鐘)`);
 
-            // 4. 使用精確的二分搜索找到區塊範圍
+            // 4. 🚀 RPC 優化：使用優化的二分搜索找到區塊範圍
             console.log(`🎯 開始精確的區塊搜索...`);
-            
-            const startBlock = await this.findExactBlockByTimestamp(startTime, 'start');
-            const endBlock = await this.findExactBlockByTimestamp(endTime, 'end');
+
+            const [startBlock, endBlock] = await Promise.all([
+                this.findExactBlockByTimestampOptimized(startTime, 'start'),
+                this.findExactBlockByTimestampOptimized(endTime, 'end')
+            ]);
 
             // 5. 結果驗證
             if (endBlock < startBlock) {
@@ -137,14 +260,14 @@ class EventScraper {
 
             const blockCount = endBlock - startBlock + 1;
             const stats = this.getRpcStats();
-            
+
             console.log(`✅ 局次 ${epoch} 區塊範圍確定:`);
             console.log(`   📍 起始區塊: ${startBlock}`);
             console.log(`   📍 結束區塊: ${endBlock}`);
             console.log(`   📊 區塊總數: ${blockCount.toLocaleString()}`);
             console.log(`   🚀 RPC調用: ${stats.totalCalls} 次 (${stats.callsPerSecond}/秒)`);
-            
-            return {
+
+            const result = {
                 from: startBlock,
                 to: endBlock,
                 timeRange: {
@@ -159,6 +282,11 @@ class EventScraper {
                 }
             };
 
+            // 🚀 RPC 優化：緩存結果
+            this.setCachedBlockRange(epoch, result);
+
+            return result;
+
         } catch (error) {
             console.error(`❌ 為局次 ${epoch} 獲取區塊範圍失敗:`, error);
             throw error;
@@ -166,25 +294,79 @@ class EventScraper {
     }
 
     /**
-     * 🎯 精確的時間戳到區塊號轉換
+     * 🎯 精確的時間戳到區塊號轉換 (優化版)
+     * 🚀 RPC 優化：使用更高效的搜索算法，減少RPC調用
      * @param {number} targetTime 目標時間戳
      * @param {string} type 搜索類型: 'start' | 'end'
      * @returns {Promise<number>} 區塊號
      */
     async findExactBlockByTimestamp(targetTime, type = 'start') {
+        return this.findExactBlockByTimestampOptimized(targetTime, type);
+    }
+
+    /**
+     * 🚀 RPC 優化：優化的二分搜索算法
+     * 減少RPC調用次數，使用更智能的搜索策略
+     */
+    async findExactBlockByTimestampOptimized(targetTime, type = 'start') {
         const isStartSearch = type === 'start';
         const searchDesc = isStartSearch ? '第一個 >= 目標時間' : '最後一個 < 目標時間';
-        
+
         console.log(`🔍 二分搜索: 尋找${searchDesc}的區塊 (目標: ${new Date(targetTime * 1000).toISOString()})`);
 
         this.trackRpcCall();
         const latestBlock = await this.provider.getBlockNumber();
-        
+
         let left = 0;
         let right = latestBlock;
         let result = isStartSearch ? latestBlock : 0;
         let iterations = 0;
-        const maxIterations = Math.ceil(Math.log2(latestBlock)) + 5; // 理論最大迭代次數
+        const maxIterations = Math.ceil(Math.log2(latestBlock)) + 5;
+
+        // 🚀 RPC 優化：預先獲取區塊時間戳範圍，減少搜索次數
+        let leftTime, rightTime;
+
+        try {
+            this.trackRpcCall();
+            const [leftBlock, rightBlock] = await Promise.all([
+                this.provider.getBlock(left),
+                this.provider.getBlock(right)
+            ]);
+            leftTime = leftBlock.timestamp;
+            rightTime = rightBlock.timestamp;
+        } catch (error) {
+            console.warn(`   ⚠️ 獲取邊界區塊時間戳失敗: ${error.message}`);
+            leftTime = 0;
+            rightTime = Math.floor(Date.now() / 1000);
+        }
+
+        // 🚀 RPC 優化：估算初始位置，減少迭代次數
+        if (targetTime >= leftTime && targetTime <= rightTime) {
+            const estimatedPosition = Math.floor(left + (right - left) * (targetTime - leftTime) / (rightTime - leftTime));
+            const mid = Math.max(left, Math.min(right, estimatedPosition));
+
+            try {
+                this.trackRpcCall();
+                const midBlock = await this.provider.getBlock(mid);
+                const midTime = midBlock.timestamp;
+
+                if ((isStartSearch && midTime >= targetTime) || (!isStartSearch && midTime < targetTime)) {
+                    result = mid;
+                }
+
+                // 根據中間值調整搜索範圍
+                if (midTime < targetTime) {
+                    left = mid + 1;
+                } else {
+                    right = mid - 1;
+                }
+            } catch (error) {
+                console.warn(`   ⚠️ 估算位置失敗: ${error.message}`);
+            }
+        }
+
+        // 🚀 RPC 優化：減少日誌輸出頻率
+        const logInterval = Math.max(5, Math.floor(maxIterations / 10));
 
         while (left <= right && iterations < maxIterations) {
             iterations++;
@@ -194,33 +376,31 @@ class EventScraper {
                 this.trackRpcCall();
                 const block = await this.provider.getBlock(mid);
                 const blockTime = block.timestamp;
-                
-                // 進度日誌 (每10次迭代或接近完成時)
-                if (iterations % 10 === 0 || right - left < 1000) {
+
+                // 🚀 RPC 優化：減少日誌輸出
+                if (iterations % logInterval === 0 || right - left < 100) {
                     console.log(`   📊 迭代 ${iterations}: 區塊 ${mid}, 時間差 ${blockTime - targetTime}s`);
                 }
 
                 if (isStartSearch) {
-                    // 尋找第一個 >= targetTime 的區塊
                     if (blockTime >= targetTime) {
                         result = mid;
-                        right = mid - 1;  // 繼續向左尋找更早的符合條件的區塊
+                        right = mid - 1;
                     } else {
-                        left = mid + 1;   // 向右尋找
+                        left = mid + 1;
                     }
                 } else {
-                    // 尋找最後一個 < targetTime 的區塊  
                     if (blockTime < targetTime) {
                         result = mid;
-                        left = mid + 1;   // 繼續向右尋找更晚的符合條件的區塊
+                        left = mid + 1;
                     } else {
-                        right = mid - 1;  // 向左尋找
+                        right = mid - 1;
                     }
                 }
 
             } catch (error) {
                 console.warn(`   ⚠️ 獲取區塊 ${mid} 失敗: ${error.message}`);
-                right = mid - 1; // 向左調整搜索範圍
+                right = mid - 1;
             }
         }
 
@@ -229,16 +409,15 @@ class EventScraper {
             this.trackRpcCall();
             const resultBlock = await this.provider.getBlock(result);
             const timeDiff = resultBlock.timestamp - targetTime;
-            
+
             console.log(`   ✅ 搜索完成: 區塊 ${result}, 時間差 ${timeDiff}s, 迭代 ${iterations} 次`);
-            
-            // 結果合理性檢查
-            if (isStartSearch && timeDiff < -300) { // 開始區塊不應該比目標時間早太多
+
+            if (isStartSearch && timeDiff < -300) {
                 console.warn(`   ⚠️ 警告: 開始區塊時間比目標時間早 ${-timeDiff} 秒`);
-            } else if (!isStartSearch && timeDiff > 300) { // 結束區塊不應該比目標時間晚太多
+            } else if (!isStartSearch && timeDiff > 300) {
                 console.warn(`   ⚠️ 警告: 結束區塊時間比目標時間晚 ${timeDiff} 秒`);
             }
-            
+
         } catch (error) {
             console.warn(`   ⚠️ 無法驗證結果區塊 ${result}: ${error.message}`);
         }
@@ -247,8 +426,8 @@ class EventScraper {
     }
 
     /**
-     * 批量抓取指定區塊範圍內的所有事件
-     * 優化：智能分批，避免RPC限制
+     * 批量抓取指定區塊範圍內的所有事件 (優化版)
+     * 🚀 RPC 優化：智能分批處理，避免RPC限制，減少總調用次數
      * @param {number} fromBlock 起始區塊
      * @param {number} toBlock 結束區塊
      * @returns {Promise<Object>} 事件數據
@@ -257,7 +436,7 @@ class EventScraper {
         try {
             const blockCount = toBlock - fromBlock + 1;
             console.log(`📊 開始抓取區塊範圍 ${fromBlock.toLocaleString()} - ${toBlock.toLocaleString()} (${blockCount.toLocaleString()} 個區塊)`);
-            
+
             const events = {
                 startRoundEvents: [],
                 lockRoundEvents: [],
@@ -268,33 +447,44 @@ class EventScraper {
                 totalEvents: 0
             };
 
-            // 並行抓取所有事件類型
-            const [
-                startRoundEvents,
-                lockRoundEvents,
-                endRoundEvents,
-                betBullEvents,
-                betBearEvents,
-                claimEvents
-            ] = await Promise.all([
-                this.fetchEventsByFilter('StartRound', this.filters.startRound, fromBlock, toBlock),
-                this.fetchEventsByFilter('LockRound', this.filters.lockRound, fromBlock, toBlock),
-                this.fetchEventsByFilter('EndRound', this.filters.endRound, fromBlock, toBlock),
-                this.fetchEventsByFilter('BetBull', this.filters.betBull, fromBlock, toBlock),
-                this.fetchEventsByFilter('BetBear', this.filters.betBear, fromBlock, toBlock),
-                this.fetchEventsByFilter('Claim', this.filters.claim, fromBlock, toBlock)
-            ]);
+            // 🚀 RPC 優化：智能分批處理
+            const maxBlocksPerBatch = 100000; // 每個批次最大區塊數
+            const totalBatches = Math.ceil(blockCount / maxBlocksPerBatch);
 
-            events.startRoundEvents = startRoundEvents;
-            events.lockRoundEvents = lockRoundEvents;
-            events.endRoundEvents = endRoundEvents;
-            events.betBullEvents = betBullEvents;
-            events.betBearEvents = betBearEvents;
-            events.claimEvents = claimEvents;
+            if (totalBatches > 1) {
+                console.log(`📦 區塊範圍較大，分 ${totalBatches} 個批次處理，每批最多 ${maxBlocksPerBatch.toLocaleString()} 個區塊`);
 
-            events.totalEvents = startRoundEvents.length + lockRoundEvents.length +
-                endRoundEvents.length + betBullEvents.length +
-                betBearEvents.length + claimEvents.length;
+                // 分批處理
+                for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+                    const batchStart = fromBlock + (batchIndex * maxBlocksPerBatch);
+                    const batchEnd = Math.min(toBlock, batchStart + maxBlocksPerBatch - 1);
+
+                    console.log(`   📦 處理批次 ${batchIndex + 1}/${totalBatches}: ${batchStart.toLocaleString()} - ${batchEnd.toLocaleString()}`);
+
+                    const batchEvents = await this.fetchEventsInBatch(batchStart, batchEnd);
+
+                    // 合併批次結果
+                    events.startRoundEvents.push(...batchEvents.startRoundEvents);
+                    events.lockRoundEvents.push(...batchEvents.lockRoundEvents);
+                    events.endRoundEvents.push(...batchEvents.endRoundEvents);
+                    events.betBullEvents.push(...batchEvents.betBullEvents);
+                    events.betBearEvents.push(...batchEvents.betBearEvents);
+                    events.claimEvents.push(...batchEvents.claimEvents);
+                }
+            } else {
+                // 單批次處理
+                const batchEvents = await this.fetchEventsInBatch(fromBlock, toBlock);
+                events.startRoundEvents = batchEvents.startRoundEvents;
+                events.lockRoundEvents = batchEvents.lockRoundEvents;
+                events.endRoundEvents = batchEvents.endRoundEvents;
+                events.betBullEvents = batchEvents.betBullEvents;
+                events.betBearEvents = batchEvents.betBearEvents;
+                events.claimEvents = batchEvents.claimEvents;
+            }
+
+            events.totalEvents = events.startRoundEvents.length + events.lockRoundEvents.length +
+                events.endRoundEvents.length + events.betBullEvents.length +
+                events.betBearEvents.length + events.claimEvents.length;
 
             console.log(`✅ 事件抓取完成:`);
             console.log(`   🎯 StartRound: ${events.startRoundEvents.length}`);
@@ -314,6 +504,37 @@ class EventScraper {
     }
 
     /**
+     * 🚀 RPC 優化：單批次事件抓取
+     */
+    async fetchEventsInBatch(fromBlock, toBlock) {
+        // 並行抓取所有事件類型
+        const [
+            startRoundEvents,
+            lockRoundEvents,
+            endRoundEvents,
+            betBullEvents,
+            betBearEvents,
+            claimEvents
+        ] = await Promise.all([
+            this.fetchEventsByFilter('StartRound', this.filters.startRound, fromBlock, toBlock),
+            this.fetchEventsByFilter('LockRound', this.filters.lockRound, fromBlock, toBlock),
+            this.fetchEventsByFilter('EndRound', this.filters.endRound, fromBlock, toBlock),
+            this.fetchEventsByFilter('BetBull', this.filters.betBull, fromBlock, toBlock),
+            this.fetchEventsByFilter('BetBear', this.filters.betBear, fromBlock, toBlock),
+            this.fetchEventsByFilter('Claim', this.filters.claim, fromBlock, toBlock)
+        ]);
+
+        return {
+            startRoundEvents,
+            lockRoundEvents,
+            endRoundEvents,
+            betBullEvents,
+            betBearEvents,
+            claimEvents
+        };
+    }
+
+    /**
      * 🎯 修復版：按事件類型抓取 - 現在會獲取真實時間戳
      */
     async fetchEventsByFilter(eventName, filter, fromBlock, toBlock) {
@@ -328,7 +549,8 @@ class EventScraper {
     }
 
     /**
-     * 🎯 修復版：解析原始事件數據並獲取真實時間戳
+     * 🎯 修復版：解析原始事件數據並獲取真實時間戳 (優化版)
+     * 🚀 RPC 優化：使用批量區塊時間戳獲取，大幅減少RPC調用
      * @param {Array} rawEvents 原始事件數組
      * @param {string} eventType 事件類型
      * @returns {Promise<Array>} 解析後的事件數組
@@ -340,23 +562,11 @@ class EventScraper {
 
         const parsedEvents = [];
 
-        // 🎯 為了優化性能，批量獲取區塊時間戳
+        // 🚀 RPC 優化：批量獲取區塊時間戳，使用優化的批量方法
         const blockNumbers = [...new Set(rawEvents.map(event => event.blockNumber))];
-        const blockTimestamps = new Map();
-
         console.log(`   📅 獲取 ${blockNumbers.length} 個區塊的時間戳 (${eventType})...`);
 
-        // 批量獲取區塊時間戳
-        for (const blockNumber of blockNumbers) {
-            try {
-                this.trackRpcCall();
-                const block = await this.provider.getBlock(blockNumber);
-                blockTimestamps.set(blockNumber, block.timestamp);
-            } catch (error) {
-                console.warn(`   ⚠️ 獲取區塊 ${blockNumber} 時間戳失敗: ${error.message}`);
-                blockTimestamps.set(blockNumber, Math.floor(Date.now() / 1000)); // 使用當前時間作為備用
-            }
-        }
+        const blockTimestamps = await this.getBlockTimestampsBatch(blockNumbers);
 
         // 解析每個事件
         for (const event of rawEvents) {
@@ -434,12 +644,16 @@ class EventScraper {
     }
 
     /**
-     * 獲取指定局次的完整事件數據
+     * 獲取指定局次的完整事件數據 (優化版)
+     * 🚀 RPC 優化：整合所有優化策略，提供最佳性能
      */
     async getEventsForEpoch(epoch) {
         try {
             console.log(`🎯 開始獲取局次 ${epoch} 的事件數據...`);
             this.resetRpcStats();
+
+            // 🚀 RPC 優化：預計算相鄰局次的區塊範圍
+            this.precalculateAdjacentEpochs(epoch);
 
             // 1. 獲取區塊範圍（當局開始時間 -> 下一局開始時間）
             const blockRange = await this.getBlockRangeForEpoch(epoch);
@@ -474,6 +688,34 @@ class EventScraper {
             console.error(`❌ 獲取局次 ${epoch} 事件數據失敗:`, error);
             throw error;
         }
+    }
+
+    /**
+     * 🚀 RPC 優化：預計算相鄰局次的區塊範圍
+     * 提前計算和緩存相鄰局次，減少後續請求
+     */
+    async precalculateAdjacentEpochs(currentEpoch) {
+        const adjacentEpochs = [
+            currentEpoch - 1,
+            currentEpoch + 1,
+            currentEpoch - 2,
+            currentEpoch + 2
+        ].filter(epoch => epoch > 0);
+
+        // 異步預計算，不阻塞當前請求
+        setImmediate(async () => {
+            for (const epoch of adjacentEpochs) {
+                try {
+                    // 只預計算未緩存的
+                    if (!this.getCachedBlockRange(epoch)) {
+                        await this.getBlockRangeForEpoch(epoch);
+                    }
+                } catch (error) {
+                    // 預計算失敗不影響主流程
+                    console.debug(`預計算局次 ${epoch} 區塊範圍失敗: ${error.message}`);
+                }
+            }
+        });
     }
 
     /**
