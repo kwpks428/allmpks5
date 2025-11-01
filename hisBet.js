@@ -172,7 +172,7 @@ class HisBetScraper {
             }
 
             // 2. 嘗試獲取 Redis 鎖
-            const lockAcquired = await this.redis.acquireLock(`lock:pancake:epoch:${epoch}`, this.config.lockTimeout);
+            const lockAcquired = await this.redis.acquireLock(epoch, this.config.lockTimeout);
             if (!lockAcquired) {
                 this.logger.debug(`🔒 局次 ${epoch} 正在被其他線程處理，跳過`);
                 return;
@@ -199,7 +199,7 @@ class HisBetScraper {
             await this.logError(epoch, error?.message || JSON.stringify(error) || '未知錯誤');
         } finally {
             // 4. 釋放鎖
-            await this.redis.releaseLock(`lock:pancake:epoch:${epoch}`);
+            await this.redis.releaseLock(epoch);
             this.logger.info(`🔓 釋放局次 ${epoch} 的鎖`);
         }
     }
