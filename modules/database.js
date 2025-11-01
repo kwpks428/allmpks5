@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 const moment = require('moment-timezone');
+const Logger = require('./logger');
 
 /**
  * 資料庫管理器
@@ -9,6 +10,7 @@ class Database {
     constructor(connectionString) {
         this.connectionString = connectionString;
         this.pool = null;
+        this.logger = new Logger();
     }
 
     /**
@@ -53,7 +55,7 @@ class Database {
             const result = await this.pool.query(text, params);
             const duration = Date.now() - start;
             // 查詢時間移到 debug 級別，避免輸出過多
-            this.debug(`📊 查詢執行時間: ${duration}ms, 查詢: ${text.substring(0, 50)}...`);
+            this.logger.debug(`📊 查詢執行時間: ${duration}ms, 查詢: ${text.substring(0, 50)}...`);
             return result;
         } catch (error) {
             console.error('❌ 資料庫查詢錯誤:', error);
