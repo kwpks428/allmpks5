@@ -220,6 +220,228 @@ class Database {
             errorEpochs: parseInt(errorEpochs.rows[0].count)
         };
     }
+
+    /**
+     * 插入歷史局次數據
+     * @param {Object} roundData 局次數據
+     * @param {Object} client 可選的事務客戶端
+     */
+    async insertHistoryRound(roundData, client = null) {
+        const db = client || this.pool;
+        
+        try {
+            // 檢查是否已存在
+            const existing = await db.query(
+                'SELECT episode FROM history_rounds WHERE episode = $1',
+                [roundData.episode]
+            );
+
+            if (existing.rows.length > 0) {
+                // 更新現有記錄
+                return await db.query(`
+                    UPDATE history_rounds SET
+                        start_block = $1,
+                        start_timestamp = $2,
+                        start_tx_hash = $3,
+                        lock_block = $4,
+                        lock_timestamp = $5,
+                        lock_tx_hash = $6,
+                        end_block = $7,
+                        end_timestamp = $8,
+                        end_tx_hash = $9,
+                        episode_start_time = $10,
+                        episode_lock_time = $11,
+                        episode_end_time = $12,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE episode = $13
+                `, [
+                    roundData.startBlock,
+                    roundData.startTimestamp,
+                    roundData.startTxHash,
+                    roundData.lockBlock || null,
+                    roundData.lockTimestamp || null,
+                    roundData.lockTxHash || null,
+                    roundData.endBlock || null,
+                    roundData.endTimestamp || null,
+                    roundData.endTxHash || null,
+                    new Date(Math.floor(roundData.startTimestamp * 1000)),
+                    roundData.lockTimestamp ? new Date(Math.floor(roundData.lockTimestamp * 1000)) : null,
+                    roundData.endTimestamp ? new Date(Math.floor(roundData.endTimestamp * 1000)) : null,
+                    roundData.episode
+                ]);
+            } else {
+                // 插入新記錄
+                return await db.query(`
+                    INSERT INTO history_rounds (
+                        episode, start_block, start_timestamp, start_tx_hash,
+                        lock_block, lock_timestamp, lock_tx_hash,
+                        end_block, end_timestamp, end_tx_hash,
+                        episode_start_time, episode_lock_time, episode_end_time,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                `, [
+                    roundData.episode,
+                    roundData.startBlock,
+                    roundData.startTimestamp,
+                    roundData.startTxHash,
+                    roundData.lockBlock || null,
+                    roundData.lockTimestamp || null,
+                    roundData.lockTxHash || null,
+                    roundData.endBlock || null,
+                    roundData.endTimestamp || null,
+                    roundData.endTxHash || null,
+                    new Date(Math.floor(roundData.startTimestamp * 1000)),
+                    roundData.lockTimestamp ? new Date(Math.floor(roundData.lockTimestamp * 1000)) : null,
+                    roundData.endTimestamp ? new Date(Math.floor(roundData.endTimestamp * 1000)) : null
+                ]);
+            }
+        } catch (error) {
+            console.error(`❌ 插入歷史局次數據失敗 (episode: ${roundData.episode}):`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * 插入歷史投注數據
+     * @param {Array} betData 投注數據陣列
+     * @param {Object} client 可選的事務客戶端
+     */
+    async insertHistoryBet(betData, client = null) {
+        if (!betData || betData.length === 0) return;
+        
+        const db = client || this.pool;
+        
+        try {
+            for (const bet of betData) {
+                await db.query(`
+                    INSERT INTO history_bets (
+                        epoch, user, amount, bet_amount, position,
+                        bet_block, bet_timestamp, bet_tx_hash,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT (epoch, user, bet_tx_hash) DO NOTHING
+                `, [
+                    bet.epoch,
+                    bet.user,
+                    bet.amount,
+                    bet.amount,
+                    bet.position,
+                    bet.blockNumber,
+                    bet.timestamp,
+                    bet.transactionHash,
+                ]);
+            }
+        } catch (error) {
+            console.error(`❌ 插入歷史投注數據失敗:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * 插入歷史認領數據
+     * @param {Array} claimData 認領數據陣列
+     * @param {Object} client 可選的事務客戶端
+     */
+    async insertHistoryClaim(claimData, client = null) {
+        if (!claimData || claimData.length === 0) return;
+        
+        const db = client || this.pool;
+        
+        try {
+            for (const claim of claimData) {
+                await db.query(`
+                    INSERT INTO history_claims (
+                        epoch, user, amount, claim_amount,
+                        claim_block, claim_timestamp, claim_tx_hash,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT (epoch, user, claim_tx_hash) DO NOTHING
+                `, [
+                    claim.epoch,
+                    claim.user,
+                    claim.amount,
+                    claim.amount,
+                    claim.blockNumber,
+                    claim.timestamp,
+                    claim.transactionHash,
+                ]);
+            }
+        } catch (error) {
+            console.error(`❌ 插入歷史認領數據失敗:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * 插入歷史多人認領數據
+     * @param {Array} multiClaimData 多人認領數據陣列
+     * @param {Object} client 可選的事務客戶端
+     */
+    async insertHistoryMultiClaim(multiClaimData, client = null) {
+        if (!multiClaimData || multiClaimData.length === 0) return;
+        
+        const db = client || this.pool;
+        
+        try {
+            for (const multiClaim of multiClaimData) {
+                await db.query(`
+                    INSERT INTO history_multi_claims (
+                        epoch, users, amount, claim_amount,
+                        claim_block, claim_timestamp, claim_tx_hash,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT (epoch, claim_tx_hash) DO NOTHING
+                `, [
+                    multiClaim.epoch,
+                    multiClaim.users,
+                    multiClaim.amount,
+                    multiClaim.amount,
+                    multiClaim.blockNumber,
+                    multiClaim.timestamp,
+                    multiClaim.transactionHash,
+                ]);
+            }
+        } catch (error) {
+            console.error(`❌ 插入歷史多人認領數據失敗:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * 插入歷史真實投注數據
+     * @param {Array} realBetData 真實投注數據陣列
+     * @param {Object} client 可選的事務客戶端
+     */
+    async insertHistoryRealBet(realBetData, client = null) {
+        if (!realBetData || realBetData.length === 0) return;
+        
+        const db = client || this.pool;
+        
+        try {
+            for (const realBet of realBetData) {
+                await db.query(`
+                    INSERT INTO history_real_bets (
+                        epoch, user, amount, bet_amount, position,
+                        bet_block, bet_timestamp, bet_tx_hash,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT (epoch, user, bet_tx_hash) DO NOTHING
+                `, [
+                    realBet.epoch,
+                    realBet.user,
+                    realBet.amount,
+                    realBet.amount,
+                    realBet.position,
+                    realBet.blockNumber,
+                    realBet.timestamp,
+                    realBet.transactionHash,
+                ]);
+            }
+        } catch (error) {
+            console.error(`❌ 插入歷史真實投注數據失敗:`, error);
+            throw error;
+        }
+    }
 }
 
 module.exports = Database;

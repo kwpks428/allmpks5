@@ -41,7 +41,7 @@ class HisBetScraper {
         this.transactionManager = null;
         this.scheduler = null;
         this.logger = null;
-        
+
         this.isShuttingDown = false;
         this.currentEpoch = null;
     }
@@ -51,39 +51,68 @@ class HisBetScraper {
      */
     async initialize() {
         try {
+            // 初始化Logger
             this.logger = new Logger();
             this.logger.info('🚀 初始化 HisBet 數據抓取系統...');
+            console.log('✅ Logger 初始化成功');
 
-            // 初始化各模組
+            // 檢查環境變數
+            console.log('🔍 檢查環境配置...');
+            console.log('RPC_URL:', this.config.rpcUrl ? '✅' : '❌');
+            console.log('REDIS_URL:', this.config.redisUrl ? '✅' : '❌');
+            console.log('POSTGRES_URL:', this.config.postgresUrl ? '✅' : '❌');
+
+            // 初始化資料庫
+            console.log('🔄 初始化資料庫...');
             this.db = new Database(this.config.postgresUrl);
             await this.db.connect();
             this.logger.info('✅ 資料庫連接成功');
+            console.log('✅ 資料庫連接成功');
 
+            // 初始化Redis
+            console.log('🔄 初始化Redis...');
             this.redis = new RedisLock(this.config.redisUrl);
             await this.redis.connect();
             this.logger.info('✅ Redis 連接成功');
+            console.log('✅ Redis 連接成功');
 
+            // 初始化事件抓取器
+            console.log('🔄 初始化事件抓取器...');
             this.eventScraper = new EventScraper(
                 this.config.rpcUrl,
                 this.config.contractAddress,
                 require('./abi.json')
             );
             this.logger.info('✅ 事件抓取器初始化成功');
+            console.log('✅ 事件抓取器初始化成功');
 
+            // 初始化數據驗證器
+            console.log('🔄 初始化數據驗證器...');
             this.dataValidator = new DataValidator(this.config.timezone);
             this.logger.info('✅ 數據驗證器初始化成功');
+            console.log('✅ 數據驗證器初始化成功');
 
+            // 初始化事務管理器
+            console.log('🔄 初始化事務管理器...');
             this.transactionManager = new TransactionManager(this.db);
             this.logger.info('✅ 事務管理器初始化成功');
+            console.log('✅ 事務管理器初始化成功');
 
+            // 初始化調度器
+            console.log('🔄 初始化調度器...');
             this.scheduler = new Scheduler(this);
             this.logger.info('✅ 任務調度器初始化成功');
+            console.log('✅ 調度器初始化成功');
 
             // 獲取當前最新局次
+            console.log('🔄 獲取當前局次...');
             this.currentEpoch = await this.eventScraper.getCurrentEpoch();
             this.logger.info(`📊 當前最新局次：${this.currentEpoch}`);
+            console.log('✅ 所有模組初始化完成');
 
         } catch (error) {
+            console.error('❌ 初始化失敗:', error);
+            console.error('❌ 錯誤堆棧:', error.stack);
             this.logger.error('❌ 系統初始化失敗:', error);
             throw error;
         }
@@ -94,7 +123,7 @@ class HisBetScraper {
      */
     async startMainThread() {
         this.logger.info('🔄 啟動主線程 (歷史數據回溯)');
-        
+
         const processEpoch = async (epoch) => {
             await this.processEpoch(epoch);
         };
@@ -115,7 +144,7 @@ class HisBetScraper {
      */
     async startSecondaryThread() {
         this.logger.info('🔄 啟動支線線程 (最新局次檢查)');
-        
+
         const processEpochs = async () => {
             const targetEpochs = [
                 this.currentEpoch - 2,
@@ -163,11 +192,19 @@ class HisBetScraper {
             await this.handleEpochProcessing(epoch);
 
         } catch (error) {
-            this.logger.error(`❌ 處理局次 ${epoch} 時發生錯誤:`, error);
-            
-            // 記錄錯誤到 errEpoch 表 (獨立於主事務)
-            await this.logError(epoch, error.message || error.toString());
-            
+            console.error(`❌ 處理局次 ${epoch} 時發生錯誤:`);
+            console.error(`❌ 錯誤對象:`, error);
+            console.error(`❌ 錯誤類型:`, typeof error);
+            console.error(`❌ 錯誤訊息:`, error?.message);
+            console.error(`❌ 錯誤堆疊:`, error?.stack);
+            console.error(`❌ 錯誤詳情:`, JSON.stringify(error, Object.getOwnPropertyNames(error)));
+
+            // 如果 error 是空對象，檢查是否有其他信息
+            if (Object.keys(error || {}).length === 0) {
+                console.error(`❌ 空錯誤對象檢測 - 可能是事務管理器問題`);
+            }
+
+            await this.logError(epoch, error?.message || JSON.stringify(error) || '未知錯誤');
         } finally {
             // 4. 釋放鎖
             await this.redis.releaseLock(`lock:pancake:epoch:${epoch}`);
@@ -197,7 +234,7 @@ class HisBetScraper {
 
         // 6. 產生 multiClaim 資料
         const multiClaimData = this.generateMultiClaimData(validationResult.claimData);
-        
+
         // 7. 執行事務性寫入
         await this.transactionManager.executeTransaction(async (trx) => {
             // 清理 realBet 臨時數據
@@ -207,7 +244,7 @@ class HisBetScraper {
             await trx.insert(validationResult.roundData, 'round');
             await trx.batchInsert(validationResult.hisBetData, 'hisBet');
             await trx.batchInsert(validationResult.claimData, 'claim');
-            
+
             if (multiClaimData.length > 0) {
                 await trx.batchInsert(multiClaimData, 'multiClaim');
             }
@@ -226,24 +263,24 @@ class HisBetScraper {
      */
     generateMultiClaimData(claimData) {
         const walletClaims = {};
-        
+
         // 按錢包地址聚合
         claimData.forEach(claim => {
             if (!walletClaims[claim.walletAddress]) {
                 walletClaims[claim.walletAddress] = {
-                    walletAddress: claim.walletAddress,
                     epoch: claim.epoch,
+                    walletAddress: claim.walletAddress,
                     claimCount: 0,
                     totalAmount: 0
                 };
             }
-            
+
             walletClaims[claim.walletAddress].claimCount += 1;
             walletClaims[claim.walletAddress].totalAmount += parseFloat(claim.claimAmount);
         });
 
         // 過濾出符合條件的巨鯨行為
-        return Object.values(walletClaims).filter(claim => 
+        return Object.values(walletClaims).filter(claim =>
             claim.claimCount >= 5 || claim.totalAmount >= 1
         );
     }
@@ -273,7 +310,7 @@ class HisBetScraper {
      */
     async gracefulShutdown() {
         if (this.isShuttingDown) return;
-        
+
         this.isShuttingDown = true;
         this.logger.info('🔄 開始優雅關閉...');
 
@@ -308,7 +345,7 @@ class HisBetScraper {
     async start() {
         try {
             await this.initialize();
-            
+
             // 啟動主線和支線
             await Promise.all([
                 this.startMainThread(),
@@ -316,7 +353,7 @@ class HisBetScraper {
             ]);
 
             this.logger.info('🎉 HisBet 數據抓取系統已啟動並運行中...');
-            
+
             // 優雅關閉處理
             process.on('SIGINT', () => this.gracefulShutdown());
             process.on('SIGTERM', () => this.gracefulShutdown());
