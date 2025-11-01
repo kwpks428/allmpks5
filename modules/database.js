@@ -17,21 +17,33 @@ class Database {
      * 連接到資料庫
      */
     async connect() {
-        this.pool = new Pool({
-            connectionString: this.connectionString,
-            max: 20,
-            idleTimeoutMillis: 30000,
-            connectionTimeoutMillis: 2000,
-        });
+        try {
+            this.pool = new Pool({
+                connectionString: this.connectionString,
+                max: 10, // 減少連接數
+                min: 2,  // 最小連接數
+                idleTimeoutMillis: 60000, // 增加空閒超時
+                connectionTimeoutMillis: 10000, // 增加連接超時
+                acquireTimeoutMillis: 60000, // 獲取連接超時
+                query_timeout: 30000, // 查詢超時
+                statement_timeout: 30000, // 語句超時
+            });
 
-        // 測試連接
-        const client = await this.pool.connect();
-        await client.query('SELECT NOW()');
-        client.release();
+            // 測試連接
+            const client = await this.pool.connect();
+            await client.query('SELECT NOW()');
+            client.release();
 
-        this.pool.on('error', (err) => {
-            console.error('❌ 資料庫連接錯誤:', err);
-        });
+            console.log('✅ 資料庫連接成功');
+
+            this.pool.on('error', (err) => {
+                console.error('❌ 資料庫連接錯誤:', err);
+            });
+
+        } catch (error) {
+            console.error('❌ 資料庫連接失敗:', error);
+            throw error;
+        }
     }
 
     /**
@@ -55,7 +67,9 @@ class Database {
             const result = await this.pool.query(text, params);
             const duration = Date.now() - start;
             // 查詢時間移到 debug 級別，避免輸出過多
-            this.logger.debug(`📊 查詢執行時間: ${duration}ms, 查詢: ${text.substring(0, 50)}...`);
+            if (this.logger) {
+                this.logger.debug(`📊 查詢執行時間: ${duration}ms, 查詢: ${text.substring(0, 50)}...`);
+            }
             return result;
         } catch (error) {
             console.error('❌ 資料庫查詢錯誤:', error);
