@@ -44,6 +44,12 @@ class HisBetScraper {
 
         this.isShuttingDown = false;
         this.currentEpoch = null;
+
+        // 🚨 連續失敗監控機制
+        this.consecutiveFailures = 0;
+        this.maxConsecutiveFailures = 3; // 連續 3 次失敗就中斷系統
+        this.failureWindowStart = null;
+        this.failureWindowDuration = 10 * 60 * 1000; // 10 分鐘失敗窗口
     }
 
     /**
@@ -168,6 +174,7 @@ class HisBetScraper {
             const exists = await this.db.checkFinEpoch(epoch);
             if (exists) {
                 this.logger.debug(`⏭️  局次 ${epoch} 已完成，跳過`);
+                this.resetFailureCounter(); // 成功處理，重置失敗計數器
                 return;
             }
 
@@ -183,6 +190,9 @@ class HisBetScraper {
             // 3. 執行完整的處理流程
             await this.handleEpochProcessing(epoch);
 
+            // 4. 處理成功，重置失敗計數器
+            this.resetFailureCounter();
+
         } catch (error) {
             console.error(`❌ 處理局次 ${epoch} 時發生錯誤:`);
             console.error(`❌ 錯誤對象:`, error);
@@ -196,11 +206,17 @@ class HisBetScraper {
                 console.error(`❌ 空錯誤對象檢測 - 可能是事務管理器問題`);
             }
 
-            await this.logError(epoch, error?.message || JSON.stringify(error) || '未知錯誤');
+            // 🚨 記錄失敗並檢查是否需要中斷系統
+            await this.handleProcessingFailure(epoch, error);
+
         } finally {
-            // 4. 釋放鎖
-            await this.redis.releaseLock(epoch);
-            this.logger.info(`🔓 釋放局次 ${epoch} 的鎖`);
+            // 5. 釋放鎖
+            try {
+                await this.redis.releaseLock(epoch);
+                this.logger.info(`🔓 釋放局次 ${epoch} 的鎖`);
+            } catch (lockError) {
+                this.logger.warn(`⚠️ 釋放鎖失敗: ${lockError.message}`);
+            }
         }
     }
 
@@ -295,6 +311,84 @@ class HisBetScraper {
             this.logger.info(`📝 錯誤日誌已記錄 (局次 ${epoch})`);
         } catch (logError) {
             this.logger.error('❌ 記錄錯誤日誌失敗:', logError);
+        }
+    }
+
+    /**
+     * 🚨 處理處理失敗
+     * @param {number} epoch 失敗的局次
+     * @param {Error} error 錯誤對象
+     */
+    async handleProcessingFailure(epoch, error) {
+        // 記錄錯誤到資料庫
+        await this.logError(epoch, error?.message || JSON.stringify(error) || '未知錯誤');
+
+        // 更新失敗計數器
+        this.consecutiveFailures++;
+
+        const now = Date.now();
+
+        // 如果是第一次失敗或超出失敗窗口，重置窗口
+        if (!this.failureWindowStart || (now - this.failureWindowStart) > this.failureWindowDuration) {
+            this.failureWindowStart = now;
+            this.consecutiveFailures = 1;
+        }
+
+        this.logger.error(`🚨 處理失敗計數: ${this.consecutiveFailures}/${this.maxConsecutiveFailures} (10分鐘窗口內)`);
+
+        // 檢查是否達到中斷閾值
+        if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
+            this.logger.error(`🚨 連續 ${this.maxConsecutiveFailures} 次處理失敗，系統將自動中斷！`);
+            this.logger.error(`🚨 最後一次失敗: 局次 ${epoch}, 錯誤: ${error?.message || '未知錯誤'}`);
+
+            // 強制中斷系統
+            await this.forceShutdown(`連續 ${this.maxConsecutiveFailures} 次處理失敗`);
+        }
+    }
+
+    /**
+     * 重置失敗計數器
+     */
+    resetFailureCounter() {
+        if (this.consecutiveFailures > 0) {
+            this.logger.info(`✅ 處理成功，重置失敗計數器 (${this.consecutiveFailures} → 0)`);
+            this.consecutiveFailures = 0;
+            this.failureWindowStart = null;
+        }
+    }
+
+    /**
+     * 🚨 強制中斷系統
+     * @param {string} reason 中斷原因
+     */
+    async forceShutdown(reason) {
+        this.logger.error(`🚨 系統強制中斷: ${reason}`);
+
+        if (this.isShuttingDown) return;
+        this.isShuttingDown = true;
+
+        try {
+            // 停止所有定時任務
+            if (this.scheduler) {
+                await this.scheduler.stop();
+            }
+
+            // 關閉資料庫連接
+            if (this.db) {
+                await this.db.disconnect();
+            }
+
+            // 關閉 Redis 連接
+            if (this.redis) {
+                await this.redis.disconnect();
+            }
+
+            this.logger.error(`🚨 系統因 ${reason} 而中斷`);
+            process.exit(1); // 使用退出碼 1 表示異常退出
+
+        } catch (error) {
+            console.error('❌ 強制關閉過程中發生錯誤:', error);
+            process.exit(1);
         }
     }
 
