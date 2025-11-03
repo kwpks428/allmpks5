@@ -18,8 +18,23 @@ class Database {
      */
     async connect() {
         try {
+            // 自動偵測 Railway/雲端資料庫 SSL 模式
+            let sslOption = undefined;
+            try {
+                const url = new URL(this.connectionString);
+                const params = new URLSearchParams(url.search);
+                const sslMode = (params.get('sslmode') || '').toLowerCase();
+                // 在 sslmode 缺省、require 或 prefer 的情況下，以寬鬆 SSL 連線避免自簽憑證導致錯誤
+                if (!sslMode || sslMode === 'require' || sslMode === 'prefer') {
+                    sslOption = { rejectUnauthorized: false };
+                }
+            } catch (e) {
+                // 忽略 URL 解析錯誤，保持預設行為
+            }
+
             this.pool = new Pool({
                 connectionString: this.connectionString,
+                ssl: sslOption,
                 max: 10, // 減少連接數
                 min: 2,  // 最小連接數
                 idleTimeoutMillis: 60000, // 增加空閒超時
@@ -131,7 +146,7 @@ class Database {
      */
     async checkFinEpoch(epoch) {
         const result = await this.query(
-            'SELECT 1 FROM finEpoch WHERE epoch = $1',
+            'SELECT 1 FROM "finEpoch" WHERE "epoch" = $1',
             [epoch]
         );
         return result.rows.length > 0;
@@ -146,12 +161,12 @@ class Database {
         const client = await this.pool.connect();
         try {
             await client.query(`
-                INSERT INTO errEpoch (epoch, errorTime, errorMessage)
+                INSERT INTO "errEpoch" ("epoch", "errorTime", "errorMessage")
                 VALUES ($1, $2, $3)
-                ON CONFLICT (epoch) 
+                ON CONFLICT ("epoch") 
                 DO UPDATE SET 
-                    errorTime = EXCLUDED.errorTime,
-                    errorMessage = EXCLUDED.errorMessage
+                    "errorTime" = EXCLUDED."errorTime",
+                    "errorMessage" = EXCLUDED."errorMessage"
             `, [errorData.epoch, errorData.errorTime, errorData.errorMessage]);
         } finally {
             client.release();
@@ -164,9 +179,9 @@ class Database {
      */
     async getLatestProcessedEpoch() {
         const result = await this.query(
-            'SELECT MAX(epoch) as maxEpoch FROM finEpoch'
+            'SELECT MAX("epoch") as "maxEpoch" FROM "finEpoch"'
         );
-        return result.rows[0].maxepoch || 0;
+        return result.rows[0].maxEpoch || 0;
     }
 
     /**
@@ -183,16 +198,17 @@ class Database {
         const db = client || this.pool;
         const table = this.sanitizeTableName(tableName);
         const columns = Object.keys(data[0]);
+        const qcols = columns.map(c => '"' + c + '"');
         const values = [];
         const placeholders = [];
 
         columns.forEach((col, index) => {
             values.push(data[0][col]);
-            placeholders.push(`$${index + 1}`);
+            placeholders.push(`${index + 1}`);
         });
 
         const query = `
-            INSERT INTO ${table} (${columns.join(', ')})
+            INSERT INTO ${table} (${qcols.join(', ')})
             VALUES (${placeholders.join(', ')})
         `;
 
@@ -215,7 +231,7 @@ class Database {
             throw new Error(`不允許的表名: ${tableName}`);
         }
         
-        return tableName;
+        return '"' + tableName + '"';
     }
 
     /**
@@ -223,11 +239,11 @@ class Database {
      * @returns {Promise<Object>} 統計信息
      */
     async getStats() {
-        const totalRounds = await this.query('SELECT COUNT(*) as count FROM round');
-        const totalBets = await this.query('SELECT COUNT(*) as count FROM hisBet');
-        const totalClaims = await this.query('SELECT COUNT(*) as count FROM claim');
-        const processedEpochs = await this.query('SELECT COUNT(*) as count FROM finEpoch');
-        const errorEpochs = await this.query('SELECT COUNT(*) as count FROM errEpoch');
+        const totalRounds = await this.query('SELECT COUNT(*) as count FROM "round"');
+        const totalBets = await this.query('SELECT COUNT(*) as count FROM "hisBet"');
+        const totalClaims = await this.query('SELECT COUNT(*) as count FROM "claim"');
+        const processedEpochs = await this.query('SELECT COUNT(*) as count FROM "finEpoch"');
+        const errorEpochs = await this.query('SELECT COUNT(*) as count FROM "errEpoch"');
 
         return {
             totalRounds: parseInt(totalRounds.rows[0].count),

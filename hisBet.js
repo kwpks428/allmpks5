@@ -10,6 +10,26 @@
 require('dotenv').config();
 const moment = require('moment-timezone');
 
+// 🧹 日誌清理：屏蔽垃圾輸出
+const originalConsoleLog = console.log;
+console.log = (...args) => {
+    const message = args.join(' ');
+
+    // 🗑️ 屏蔽這些垃圾日誌
+    const spamKeywords = [
+        '📊 階段', '📊 迭代', '📊 樣本估算', '📊 粗略範圍',
+        '📊 範圍已縮小', '🔍 超級二分搜索', '📦 批量獲取',
+        '📅 獲取', '🚀 預熱', '🔄 啟動主線程任務',
+        '📊 當前最新局次', '⏰ 局次', '⏱️ 時間範圍'
+    ];
+
+    if (spamKeywords.some(keyword => message.includes(keyword))) {
+        return; // 直接屏蔽
+    }
+
+    originalConsoleLog(...args);
+};
+
 // 導入自定義模組
 const Database = require('./modules/database');
 const RedisLock = require('./modules/redisLock');
@@ -48,8 +68,7 @@ class HisBetScraper {
         // 🚨 連續失敗監控機制
         this.consecutiveFailures = 0;
         this.maxConsecutiveFailures = 3; // 連續 3 次失敗就中斷系統
-        this.failureWindowStart = null;
-        this.failureWindowDuration = 10 * 60 * 1000; // 10 分鐘失敗窗口
+        // ⭐️ 移除失敗窗口相關的變數，因為我們不需要窗口概念
     }
 
     /**
@@ -234,8 +253,11 @@ class HisBetScraper {
         this.logger.blockchain('抓取事件', blockRange.to, Date.now());
         this.logger.info(`📊 抓取到 ${eventsData.totalEvents} 個事件`);
 
-        // 5. 數據驗證
-        const validationResult = await this.dataValidator.validateEpochData(eventsData);
+        // 5. 以 rounds(epoch) 作為事件不足時的補齊資訊
+        const roundInfo = await this.eventScraper.getRoundInfo(epoch);
+
+        // 5. 數據驗證（帶入 roundInfo 作為後備資料）
+        const validationResult = await this.dataValidator.validateEpochData(eventsData, epoch, roundInfo);
         if (!validationResult.isValid) {
             throw new Error(`數據驗證失敗: ${validationResult.errors.join(', ')}`);
         }
@@ -323,25 +345,17 @@ class HisBetScraper {
         // 記錄錯誤到資料庫
         await this.logError(epoch, error?.message || JSON.stringify(error) || '未知錯誤');
 
-        // 更新失敗計數器
+        // ⭐️ 簡化邏輯：直接計數連續失敗
         this.consecutiveFailures++;
 
-        const now = Date.now();
+        this.logger.error(`🚨 處理失敗計數: ${this.consecutiveFailures}/${this.maxConsecutiveFailures}`);
 
-        // 如果是第一次失敗或超出失敗窗口，重置窗口
-        if (!this.failureWindowStart || (now - this.failureWindowStart) > this.failureWindowDuration) {
-            this.failureWindowStart = now;
-            this.consecutiveFailures = 1;
-        }
-
-        this.logger.error(`🚨 處理失敗計數: ${this.consecutiveFailures}/${this.maxConsecutiveFailures} (10分鐘窗口內)`);
-
-        // 檢查是否達到中斷閾值
+        // ⭐️ 立即檢查是否達到中斷閾值
         if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
-            this.logger.error(`🚨 連續 ${this.maxConsecutiveFailures} 次處理失敗，系統將自動中斷！`);
+            this.logger.error(`🚨 連續 ${this.maxConsecutiveFailures} 次處理失敗，系統立即中斷！`);
             this.logger.error(`🚨 最後一次失敗: 局次 ${epoch}, 錯誤: ${error?.message || '未知錯誤'}`);
 
-            // 強制中斷系統
+            // ⭐️ 立即強制中斷系統
             await this.forceShutdown(`連續 ${this.maxConsecutiveFailures} 次處理失敗`);
         }
     }
@@ -353,7 +367,6 @@ class HisBetScraper {
         if (this.consecutiveFailures > 0) {
             this.logger.info(`✅ 處理成功，重置失敗計數器 (${this.consecutiveFailures} → 0)`);
             this.consecutiveFailures = 0;
-            this.failureWindowStart = null;
         }
     }
 
@@ -378,16 +391,19 @@ class HisBetScraper {
                 await this.db.disconnect();
             }
 
-            // 關閉 Redis 連接
+            // 關閉Redis連接
             if (this.redis) {
                 await this.redis.disconnect();
             }
 
-            this.logger.error(`🚨 系統因 ${reason} 而中斷`);
-            process.exit(1); // 使用退出碼 1 表示異常退出
+            this.logger.error('🚨 系統已完全關閉');
 
-        } catch (error) {
-            console.error('❌ 強制關閉過程中發生錯誤:', error);
+            // ⭐️ 立即退出進程
+            process.exit(1);
+
+        } catch (shutdownError) {
+            this.logger.error('❌ 關閉過程中發生錯誤:', shutdownError);
+            // ⭐️ 即使關閉過程有錯誤，也要強制退出
             process.exit(1);
         }
     }

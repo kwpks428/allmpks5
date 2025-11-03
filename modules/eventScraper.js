@@ -1,6 +1,19 @@
 const { ethers } = require('ethers');
 const moment = require('moment-timezone');
 
+// 🧹 日誌清理：環境變量控制
+const ENABLE_VERBOSE = process.env.ENABLE_VERBOSE_LOGS === 'true';
+const ENABLE_DEBUG = process.env.ENABLE_DEBUG_LOGS === 'true';
+
+// 簡化日誌函數
+function verboseLog(...args) {
+    if (ENABLE_VERBOSE) console.log(...args);
+}
+
+function debugLog(...args) {
+    if (ENABLE_DEBUG) console.log(...args);
+}
+
 /**
  * 事件抓取器 - 優化版本
  * 嚴格按照：當前局次開始時間 -> 下一局開始時間 的區塊範圍策略
@@ -30,19 +43,19 @@ class EventScraper {
 
         // 🚀 RPC 優化：區塊範圍緩存
         this.blockRangeCache = new Map();
-        this.cacheExpiry = 5 * 60 * 1000; // 5分鐘緩存
+        this.cacheExpiry = 30 * 60 * 1000; // 30分鐘緩存（減少重複定位）
 
         // 🚀 RPC 優化：區塊時間戳緩存
         this.blockTimestampCache = new Map();
-        this.timestampCacheExpiry = 10 * 60 * 1000; // 10分鐘緩存
+        this.timestampCacheExpiry = 60 * 60 * 1000; // 60分鐘緩存（時間戳變化不大）
 
         // 🚀 RPC 優化：批量請求配置
-        this.batchSize = 50; // 批量獲取區塊時間戳的最大數量
+        this.batchSize = 200; // 單批查區塊時間戳擴大，降低往返次數
 
         // 🚀 RPC 優化：區塊範圍預熱機制
         this.blockRangePrewarm = new Map();
-        this.prewarmBatchSize = 10; // 預熱批次大小
-        this.prewarmEnabled = true; // 預熱開關
+        this.prewarmBatchSize = 5; // 降低預熱負擔，避免啟動時暴衝
+        this.prewarmEnabled = false; // 預熱開關（關閉以避免背景RPC膨脹）
     }
 
     /**
@@ -115,7 +128,7 @@ class EventScraper {
 
         // 批量獲取未緩存的區塊
         if (uncachedBlocks.length > 0) {
-            console.log(`   📦 批量獲取 ${uncachedBlocks.length} 個區塊時間戳...`);
+            verboseLog(`   📦 批量獲取 ${uncachedBlocks.length} 個區塊時間戳...`);
 
             // 分批處理，避免單次請求過大
             for (let i = 0; i < uncachedBlocks.length; i += this.batchSize) {
@@ -174,7 +187,7 @@ class EventScraper {
             this.trackRpcCall();
             const currentEpoch = await this.contract.currentEpoch();
             const epochNum = Number(currentEpoch);
-            console.log(`📊 當前最新局次: ${epochNum}`);
+            verboseLog(`📊 當前最新局次: ${epochNum}`);
 
             // 🚀 RPC 優化：獲取當前局次後自動開始預熱
             if (this.prewarmEnabled && !this.blockRangePrewarm.has('started')) {
@@ -224,7 +237,7 @@ class EventScraper {
                 throw new Error(`局次 ${epoch} 尚未開始或無效`);
             }
 
-            console.log(`⏰ 局次 ${epoch} 開始時間: ${new Date(startTime * 1000).toISOString()}`);
+            verboseLog(`⏰ 局次 ${epoch} 開始時間: ${new Date(startTime * 1000).toISOString()}`);
 
             // 2. 獲取下一局的開始時間作為結束邊界
             let endTime;
@@ -238,7 +251,7 @@ class EventScraper {
                 if (nextStartTime > 0) {
                     endTime = nextStartTime;
                     nextEpochExists = true;
-                    console.log(`⏰ 局次 ${epoch + 1} 開始時間: ${new Date(endTime * 1000).toISOString()}`);
+                    verboseLog(`⏰ 局次 ${epoch + 1} 開始時間: ${new Date(endTime * 1000).toISOString()}`);
                 } else {
                     // 下一局還沒開始，使用當前時間
                     endTime = Math.floor(Date.now() / 1000);
@@ -256,14 +269,14 @@ class EventScraper {
             }
 
             const duration = endTime - startTime;
-            console.log(`⏱️ 時間範圍: ${duration} 秒 (${Math.floor(duration / 60)} 分鐘)`);
+            verboseLog(`⏱️ 時間範圍: ${duration} 秒 (${Math.floor(duration / 60)} 分鐘)`);
 
-            // 4. 🚀 RPC 優化：使用優化的二分搜索找到區塊範圍
-            console.log(`🎯 開始精確的區塊搜索...`);
+            // 4. 輕量：使用「初猜 + 微調」找到區塊範圍（避免重型二分搜索）
+            console.log(`🎯 使用輕量微調定位區塊...`);
 
             const [startBlock, endBlock] = await Promise.all([
-                this.findExactBlockByTimestampOptimized(startTime, 'start'),
-                this.findExactBlockByTimestampOptimized(endTime, 'end')
+                this.findBlockForTime(startTime, 'gte'),
+                this.findBlockForTime(endTime, 'lt')
             ]);
 
             // 5. 結果驗證
@@ -313,6 +326,134 @@ class EventScraper {
      * @param {string} type 搜索類型: 'start' | 'end'
      * @returns {Promise<number>} 區塊號
      */
+    // 🎯 輕量版：時間對區塊定位（初猜 + 微調，最多少量 getBlock）
+    async findBlockForTime(targetTime, mode = 'gte') {
+        const isGte = mode === 'gte';
+        // 1) 取得最新區塊，作為邊界與回退保護
+        this.trackRpcCall();
+        const latest = await this.provider.getBlockNumber();
+
+        // 2) 從快取推估初值：使用最近一筆範圍（from/to）線性外插
+        let guess = null;
+        const cachedRanges = Array.from(this.blockRangeCache.values())
+            .map(e => e.data)
+            .filter(e => e && e.timeRange)
+            .sort((a, b) => b.timeRange.startTime - a.timeRange.startTime);
+        if (cachedRanges.length > 0) {
+            const ref = cachedRanges[0];
+            const refTime = ref.timeRange.startTime;
+            const refBlock = ref.from;
+            // 使用保守 blocksPerEpoch 估算（約 110 blocks / 300s ≈ 0.3667 bps）
+            const bps = 110 / 300;
+            const delta = Math.floor((targetTime - refTime) * bps);
+            guess = Math.max(0, Math.min(latest, refBlock + delta));
+        } else {
+            // 沒快取時，保守地用 latest - 500k 作左界，線性回推
+            const bps = 110 / 300;
+            guess = Math.max(0, Math.min(latest, Math.floor(latest - (60 * 60 * 24) * bps))); // 約回推一天
+        }
+
+        // 3) 微調：固定步進 ΔBlocks，最多 3 次；必要時 1 次二分收尾
+        const step = 100; // 可調 50~150
+        let block = guess;
+        let attempts = 0;
+        let lastTime = null;
+
+        // 先讀取 guess 的時間
+        try {
+            this.trackRpcCall();
+            lastTime = (await this.provider.getBlock(block)).timestamp;
+        } catch (e) {
+            // 若失敗，調整到 latest 再試
+            block = Math.min(block + step, latest);
+            this.trackRpcCall();
+            lastTime = (await this.provider.getBlock(block)).timestamp;
+        }
+
+        while (attempts < 3) {
+            attempts++;
+            if (isGte) {
+                if (lastTime >= targetTime) {
+                    // 嘗試往前逼近
+                    const prev = Math.max(0, block - step);
+                    this.trackRpcCall();
+                    const t = (await this.provider.getBlock(prev)).timestamp;
+                    if (t >= targetTime) {
+                        block = prev; lastTime = t; continue;
+                    }
+                    // 上一個已經 < 目標，當前就是第一個 >=
+                    break;
+                } else {
+                    // 還太早，往後移動
+                    const next = Math.min(latest, block + step);
+                    this.trackRpcCall();
+                    const t = (await this.provider.getBlock(next)).timestamp;
+                    block = next; lastTime = t; continue;
+                }
+            } else {
+                // mode = 'lt'
+                if (lastTime < targetTime) {
+                    // 往後試探，看看是否仍 < 目標
+                    const next = Math.min(latest, block + step);
+                    this.trackRpcCall();
+                    const t = (await this.provider.getBlock(next)).timestamp;
+                    if (t < targetTime) { block = next; lastTime = t; continue; }
+                    // 下一個已經 >= 目標，當前就是最後一個 <
+                    break;
+                } else {
+                    // 時間太晚了，往前退
+                    const prev = Math.max(0, block - step);
+                    this.trackRpcCall();
+                    const t = (await this.provider.getBlock(prev)).timestamp;
+                    block = prev; lastTime = t; continue;
+                }
+            }
+        }
+
+        // 4) 如仍不確定，做一次小範圍二分（最多 2 次）
+        let left = Math.max(0, block - step);
+        let right = Math.min(latest, block + step);
+        let iterations = 0;
+        while (iterations < 2 && left <= right) {
+            iterations++;
+            const mid = Math.floor((left + right) / 2);
+            this.trackRpcCall();
+            const midTime = (await this.provider.getBlock(mid)).timestamp;
+            if (isGte) {
+                if (midTime >= targetTime) { right = mid - 1; block = mid; lastTime = midTime; }
+                else { left = mid + 1; }
+            } else {
+                if (midTime < targetTime) { left = mid + 1; block = mid; lastTime = midTime; }
+                else { right = mid - 1; }
+            }
+        }
+
+        // 邊界修正：確保滿足條件
+        if (isGte) {
+            // 確保第一個 >= targetTime
+            while (block > 0) {
+                const prev = block - 1;
+                this.trackRpcCall();
+                const t = (await this.provider.getBlock(prev)).timestamp;
+                if (t >= targetTime) { block = prev; lastTime = t; }
+                else break;
+                if (block % step === 0) break; // 避免向左掃描過久
+            }
+        } else {
+            // 確保最後一個 < targetTime
+            while (block < latest) {
+                const next = block + 1;
+                this.trackRpcCall();
+                const t = (await this.provider.getBlock(next)).timestamp;
+                if (t < targetTime) { block = next; lastTime = t; }
+                else break;
+                if ((next - guess) > step) break; // 避免向右掃描過久
+            }
+        }
+
+        return block;
+    }
+
     async findExactBlockByTimestamp(targetTime, type = 'start') {
         return this.findExactBlockByTimestampOptimized(targetTime, type);
     }
@@ -322,23 +463,23 @@ class EventScraper {
      * 目標：將 RPC 調用次數減少到 50-100 次以內
      * 策略：多階段搜索 + 更精確的估算 + 區塊範圍預熱
      */
-    async findExactBlockByTimestampOptimized(targetTime, type = 'start') {
+    async findExactBlockByTimestampOptimized(targetTime, type = 'start', initialGuess = null) {
         const isStartSearch = type === 'start';
         const searchDesc = isStartSearch ? '第一個 >= 目標時間' : '最後一個 < 目標時間';
 
-        console.log(`🔍 超級二分搜索: 尋找${searchDesc}的區塊 (目標: ${new Date(targetTime * 1000).toISOString()})`);
+        verboseLog(`🔍 超級二分搜索: 尋找${searchDesc}的區塊 (目標: ${new Date(targetTime * 1000).toISOString()})`);
 
         this.trackRpcCall();
         const latestBlock = await this.provider.getBlockNumber();
 
-        let left = 0;
+        let left = Math.max(0, latestBlock - 5_000_000); // 限縮到近期 5M 區塊
         let right = latestBlock;
         let result = isStartSearch ? latestBlock : 0;
         let iterations = 0;
         let rpcCalls = 0;
 
         // 🚀 階段1：粗略估算，使用更大的步長快速縮小範圍
-        console.log(`   📊 階段1: 粗略估算範圍...`);
+        verboseLog(`   📊 階段1: 粗略估算範圍...`);
 
         // 獲取邊界時間戳
         let leftTime, rightTime;
@@ -424,7 +565,7 @@ class EventScraper {
                 const midBlock = await this.provider.getBlock(mid);
                 const midTime = midBlock.timestamp;
 
-                console.log(`   📊 樣本估算: 區塊 ${mid}, 時間 ${new Date(midTime * 1000).toISOString()}, 誤差 ${Math.abs(midTime - targetTime)}s`);
+                verboseLog(`   📊 樣本估算: 區塊 ${mid}, 時間 ${new Date(midTime * 1000).toISOString()}, 誤差 ${Math.abs(midTime - targetTime)}s`);
 
                 // 根據估算結果調整搜索範圍
                 if (midTime < targetTime) {
@@ -459,17 +600,22 @@ class EventScraper {
             }
         }
 
-        console.log(`   📊 粗略範圍縮小到: ${left} - ${right} (${right - left + 1} 個區塊), RPC調用: ${rpcCalls}`);
+        verboseLog(`   📊 粗略範圍縮小到: ${left} - ${right} (${right - left + 1} 個區塊), RPC調用: ${rpcCalls}`);
 
         // 🚀 階段2：精細二分搜索，使用更小的步長
-        console.log(`   📊 階段2: 精細二分搜索...`);
+        verboseLog(`   📊 階段2: 精細二分搜索...`);
 
-        const maxIterations = Math.min(50, Math.ceil(Math.log2(right - left)) + 10); // 限制最大迭代次數
+        const maxIterations = Math.min(24, Math.ceil(Math.log2(Math.max(1, right - left))) + 6); // 進一步限制迭代
         const logInterval = Math.max(5, Math.floor(maxIterations / 8));
 
         while (left <= right && iterations < maxIterations) {
             iterations++;
-            const mid = Math.floor((left + right) / 2);
+            let mid;
+            if (initialGuess && iterations === 1) {
+                mid = Math.max(left, Math.min(right, initialGuess));
+            } else {
+                mid = Math.floor((left + right) / 2);
+            }
 
             try {
                 this.trackRpcCall(); rpcCalls++;
@@ -478,7 +624,7 @@ class EventScraper {
 
                 // 減少日誌輸出
                 if (iterations % logInterval === 0 || right - left < 50) {
-                    console.log(`   📊 迭代 ${iterations}: 區塊 ${mid}, 時間差 ${blockTime - targetTime}s, 範圍 ${right - left + 1}`);
+                    debugLog(`   📊 迭代 ${iterations}: 區塊 ${mid}, 時間差 ${blockTime - targetTime}s, 範圍 ${right - left + 1}`);
                 }
 
                 if (isStartSearch) {
@@ -498,8 +644,8 @@ class EventScraper {
                 }
 
                 // 提前終止條件：範圍已經很小
-                if (right - left < 10) {
-                    console.log(`   📊 範圍已縮小到 ${right - left + 1} 個區塊，提前終止搜索`);
+                if (right - left < 50) {
+                    verboseLog(`   📊 範圍已縮小到 ${right - left + 1} 個區塊，提前終止搜索`);
                     break;
                 }
 
@@ -515,17 +661,17 @@ class EventScraper {
         }
 
         // 🚀 階段3：最終驗證和微調
-        console.log(`   📊 階段3: 最終驗證...`);
+        verboseLog(`   📊 階段3: 最終驗證...`);
 
         try {
             this.trackRpcCall(); rpcCalls++;
             const resultBlock = await this.provider.getBlock(result);
-            const timeDiff = resultBlock.timestamp - targetTime;
+            const timeDiff = (resultBlock?.timestamp ?? targetTime) - targetTime;
 
             console.log(`   ✅ 搜索完成: 區塊 ${result}, 時間差 ${timeDiff}s, 總迭代 ${iterations} 次, 總RPC調用 ${rpcCalls} 次`);
 
             // 微調：如果時間差太大，嘗試找更好的區塊
-            if (isStartSearch && timeDiff < -60) { // 開始搜索允許稍微早一點
+            if (isStartSearch && timeDiff < -120) { // 開始搜索允許稍微早一點
                 // 檢查下一個區塊是否更好
                 try {
                     this.trackRpcCall(); rpcCalls++;
@@ -537,7 +683,7 @@ class EventScraper {
                 } catch (error) {
                     // 忽略微調失敗
                 }
-            } else if (!isStartSearch && timeDiff > 60) { // 結束搜索允許稍微晚一點
+            } else if (!isStartSearch && timeDiff > 120) { // 結束搜索允許稍微晚一點
                 // 檢查前一個區塊是否更好
                 try {
                     this.trackRpcCall(); rpcCalls++;
@@ -577,6 +723,7 @@ class EventScraper {
             console.log(`📊 開始抓取區塊範圍 ${fromBlock.toLocaleString()} - ${toBlock.toLocaleString()} (${blockCount.toLocaleString()} 個區塊)`);
 
             const events = {
+                // 我們只關注下注與領獎
                 startRoundEvents: [],
                 lockRoundEvents: [],
                 endRoundEvents: [],
@@ -589,6 +736,8 @@ class EventScraper {
             // 🚀 RPC 優化：智能分批處理
             const maxBlocksPerBatch = 100000; // 每個批次最大區塊數
             const totalBatches = Math.ceil(blockCount / maxBlocksPerBatch);
+
+            // 對相鄰 epoch 復用範圍：若 fromBlock 與 toBlock 差距 < 1500，直接單批處理避免分批浪費
 
             if (totalBatches > 1) {
                 console.log(`📦 區塊範圍較大，分 ${totalBatches} 個批次處理，每批最多 ${maxBlocksPerBatch.toLocaleString()} 個區塊`);
@@ -648,25 +797,19 @@ class EventScraper {
     async fetchEventsInBatch(fromBlock, toBlock) {
         // 並行抓取所有事件類型
         const [
-            startRoundEvents,
-            lockRoundEvents,
-            endRoundEvents,
             betBullEvents,
             betBearEvents,
             claimEvents
         ] = await Promise.all([
-            this.fetchEventsByFilter('StartRound', this.filters.startRound, fromBlock, toBlock),
-            this.fetchEventsByFilter('LockRound', this.filters.lockRound, fromBlock, toBlock),
-            this.fetchEventsByFilter('EndRound', this.filters.endRound, fromBlock, toBlock),
             this.fetchEventsByFilter('BetBull', this.filters.betBull, fromBlock, toBlock),
             this.fetchEventsByFilter('BetBear', this.filters.betBear, fromBlock, toBlock),
             this.fetchEventsByFilter('Claim', this.filters.claim, fromBlock, toBlock)
         ]);
 
         return {
-            startRoundEvents,
-            lockRoundEvents,
-            endRoundEvents,
+            startRoundEvents: [],
+            lockRoundEvents: [],
+            endRoundEvents: [],
             betBullEvents,
             betBearEvents,
             claimEvents
@@ -679,7 +822,21 @@ class EventScraper {
     async fetchEventsByFilter(eventName, filter, fromBlock, toBlock) {
         try {
             this.trackRpcCall();
-            const rawEvents = await this.contract.queryFilter(filter, fromBlock, toBlock);
+            // 若範圍過大，先切割成較小片段聚合（降低單次 provider 壓力）
+            const sliceSize = Number(process.env.SLICE_SIZE) || 20_000;
+            const results = [];
+            let cursor = fromBlock;
+            while (cursor <= toBlock) {
+                const end = Math.min(toBlock, cursor + sliceSize - 1);
+                this.trackRpcCall();
+                const part = await this.contract.queryFilter(filter, cursor, end);
+                results.push(...part);
+                cursor = end + 1;
+                // 輕微節流，避免節點限流導致隱性重試
+                const sleepMs = Number(process.env.SLICE_SLEEP_MS) || 180;
+                await new Promise(r => setTimeout(r, sleepMs));
+            }
+            const rawEvents = results;
             return await this.parseEvents(rawEvents, eventName); // 🎯 改為 await
         } catch (error) {
             console.warn(`⚠️ 抓取 ${eventName} 事件失敗 (區塊 ${fromBlock}-${toBlock}):`, error.message);
@@ -703,7 +860,7 @@ class EventScraper {
 
         // 🚀 RPC 優化：批量獲取區塊時間戳，使用優化的批量方法
         const blockNumbers = [...new Set(rawEvents.map(event => event.blockNumber))];
-        console.log(`   📅 獲取 ${blockNumbers.length} 個區塊的時間戳 (${eventType})...`);
+        verboseLog(`   📅 獲取 ${blockNumbers.length} 個區塊的時間戳 (${eventType})...`);
 
         const blockTimestamps = await this.getBlockTimestampsBatch(blockNumbers);
 
@@ -833,7 +990,7 @@ class EventScraper {
      * 🚀 RPC 優化：預計算相鄰局次的區塊範圍
      * 提前計算和緩存相鄰局次，減少後續請求
      */
-    async precalculateAdjacentEpochs(currentEpoch) {
+    async precalculateAdjacentEpochs(currentEpoch) { /* 關閉以避免背景RPC膨脹 */ return; 
         const adjacentEpochs = [
             currentEpoch - 1,
             currentEpoch + 1,
@@ -863,12 +1020,12 @@ class EventScraper {
      */
     async prewarmBlockRanges() {
         if (!this.prewarmEnabled) {
-            console.log('🚀 區塊範圍預熱已禁用');
+            verboseLog('🚀 區塊範圍預熱已禁用');
             return;
         }
 
         try {
-            console.log('🚀 開始區塊範圍預熱...');
+            verboseLog('🚀 開始區塊範圍預熱...');
 
             this.trackRpcCall();
             const currentEpoch = await this.contract.currentEpoch();
@@ -883,7 +1040,7 @@ class EventScraper {
                 }
             }
 
-            console.log(`🚀 預熱 ${epochsToPrewarm.length} 個局次的區塊範圍...`);
+            verboseLog(`🚀 預熱 ${epochsToPrewarm.length} 個局次的區塊範圍...`);
 
             // 批量預熱，但不要阻塞主線程
             setImmediate(async () => {

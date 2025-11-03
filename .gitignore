@@ -47,3 +47,10 @@ scripts/createSchema.js
 # Production builds
 dist/
 build/
+.ariana/
+.traces/
+.ariana_saved_traces/
+.vault_secret_key
+.env
+logs/
+node_modules/

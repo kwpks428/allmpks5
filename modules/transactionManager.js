@@ -65,7 +65,8 @@ class TransactionManager {
                 const values = Object.values(data);
                 const placeholders = columns.map((_, index) => `$${index + 1}`).join(', ');
                 
-                const query = `INSERT INTO ${sanitizedTable} (${columns.join(', ')}) VALUES (${placeholders})`;
+                const qcols = columns.map(c => '"' + c + '"').join(', ');
+                const query = `INSERT INTO ${sanitizedTable} (${qcols}) VALUES (${placeholders})`;
                 return client.query(query, values);
             },
             
@@ -82,24 +83,21 @@ class TransactionManager {
 
                 const sanitizedTable = this.database.sanitizeTableName(tableName);
                 const columns = Object.keys(dataArray[0]);
+                const qcols = columns.map(c => '"' + c + '"').join(', ');
                 const values = [];
-                const placeholders = [];
 
-                dataArray.forEach((data, rowIndex) => {
-                    columns.forEach((col, colIndex) => {
+                const rowPlaceholders = dataArray.map((data, rowIndex) => {
+                    const ph = columns.map((col, colIndex) => {
                         const paramIndex = rowIndex * columns.length + colIndex + 1;
-                        placeholders.push(`$${paramIndex}`);
                         values.push(data[col]);
+                        return `${paramIndex}`;
                     });
-                });
+                    return `(${ph.join(', ')})`;
+                }).join(', ');
 
                 const query = `
-                    INSERT INTO ${sanitizedTable} (${columns.join(', ')})
-                    VALUES ${dataArray.map((_, rowIndex) => 
-                        `(${columns.map((_, colIndex) => 
-                            `$${rowIndex * columns.length + colIndex + 1}`
-                        ).join(', ')})`
-                    ).join(', ')}
+                    INSERT INTO ${sanitizedTable} (${qcols})
+                    VALUES ${rowPlaceholders}
                 `;
 
                 return client.query(query, values);
@@ -128,7 +126,7 @@ class TransactionManager {
             update: (tableName, data, conditions) => {
                 const sanitizedTable = this.database.sanitizeTableName(tableName);
                 const setClause = this.buildSetClause(data);
-                const whereClause = this.buildWhereClause(conditions);
+                const whereClause = this.buildWhereClause(conditions, setClause.params.length);
                 
                 const query = `
                     UPDATE ${sanitizedTable} 
@@ -149,7 +147,7 @@ class TransactionManager {
             select: (tableName, conditions = {}, columns = ['*']) => {
                 const sanitizedTable = this.database.sanitizeTableName(tableName);
                 const whereClause = this.buildWhereClause(conditions);
-                const columnsStr = Array.isArray(columns) ? columns.join(', ') : columns;
+                const columnsStr = Array.isArray(columns) ? columns.map(c => c === '*' ? '*' : '"' + c + '"').join(', ') : columns;
                 
                 const query = `SELECT ${columnsStr} FROM ${sanitizedTable} ${whereClause.sql}`;
                 return client.query(query, whereClause.params);
@@ -173,28 +171,34 @@ class TransactionManager {
      * @param {Object} conditions 條件
      * @returns {Object} WHERE 子句和參數
      */
-    buildWhereClause(conditions) {
+    buildWhereClause(conditions, offset = 0) {
         if (!conditions || Object.keys(conditions).length === 0) {
             return { sql: '', params: [] };
         }
 
-        const conditionsArray = Object.entries(conditions).map(([key, value], index) => {
+        const params = [];
+        const parts = [];
+        let paramIndex = offset;
+
+        for (const [key, value] of Object.entries(conditions)) {
+            const qkey = '"' + key + '"';
             if (Array.isArray(value)) {
-                // 處理 IN 子句
-                const placeholders = value.map((_, i) => `$${index * 100 + i + 1}`).join(', ');
-                return `${key} IN (${placeholders})`;
+                const ph = value.map((v) => {
+                    paramIndex += 1;
+                    params.push(v);
+                    return `${paramIndex}`;
+                }).join(', ');
+                parts.push(`${qkey} IN (${ph})`);
             } else if (value === null) {
-                return `${key} IS NULL`;
+                parts.push(`${qkey} IS NULL`);
             } else {
-                return `${key} = $${index + 1}`;
+                paramIndex += 1;
+                params.push(value);
+                parts.push(`${qkey} = ${paramIndex}`);
             }
-        });
+        }
 
-        const sql = `WHERE ${conditionsArray.join(' AND ')}`;
-        const params = Object.entries(conditions)
-            .filter(([_, value]) => value !== null && !Array.isArray(value))
-            .map(([_, value]) => value);
-
+        const sql = parts.length ? `WHERE ${parts.join(' AND ')}` : '';
         return { sql, params };
     }
 
@@ -204,10 +208,10 @@ class TransactionManager {
      * @returns {Object} SET 子句和參數
      */
     buildSetClause(data) {
-        const setArray = Object.keys(data).map((key, index) => `${key} = $${index + 1}`);
+        const keys = Object.keys(data);
+        const setArray = keys.map((key, index) => `"${key}" = ${index + 1}`);
         const sql = setArray.join(', ');
-        const params = Object.values(data);
-
+        const params = keys.map(k => data[k]);
         return { sql, params };
     }
 
